@@ -419,6 +419,15 @@ let package = Package(
             ],
             swiftSettings: sharedSwiftSettings
         ),
+        .testTarget(
+            name: "WatchFeatureTests",
+            dependencies: [
+                "WatchFeature",
+                .product(name: "AnkiKit", package: "amgi"),
+                .product(name: "AmgiCardWeb", package: "amgi"),
+            ],
+            swiftSettings: sharedSwiftSettings
+        ),
         .target(
             name: "IntentsFeature",
             dependencies: [

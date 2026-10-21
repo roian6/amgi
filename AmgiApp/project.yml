@@ -281,7 +281,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.amgiapp.AmgiApp.watch
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_WKCompanionAppBundleIdentifier: com.amgiapp.AmgiApp
+        INFOPLIST_KEY_WKWatchOnly: YES
 
   AmgiAppTests:
     type: bundle.unit-test

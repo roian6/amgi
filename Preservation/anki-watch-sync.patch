@@ -1,0 +1,734 @@
+diff --git a/rslib/src/backend/sync.rs b/rslib/src/backend/sync.rs
+index fc198e8da5a8024770deb3238095dfb17ca307ed..2f2870469cd95d8d1a67dd0ad9e9c9d2af94aa1d 100644
+--- a/rslib/src/backend/sync.rs
++++ b/rslib/src/backend/sync.rs
+@@ -98,8 +98,16 @@ impl TryFrom<anki_proto::sync::SyncAuth> for SyncAuth {
+ 
+ impl crate::services::BackendSyncService for Backend {
+     fn sync_media(&self, input: anki_proto::sync::SyncAuth) -> Result<()> {
+-        let auth = input.try_into()?;
+-        self.sync_media_in_background(auth, None)
++        #[cfg(target_os = "watchos")]
++        {
++            let _ = input;
++            invalid_input!("media sync is unavailable on watchOS")
++        }
++        #[cfg(not(target_os = "watchos"))]
++        {
++            let auth = input.try_into()?;
++            self.sync_media_in_background(auth, None)
++        }
+     }
+ 
+     fn media_sync_status(&self) -> Result<MediaSyncStatusResponse> {
+@@ -360,6 +368,7 @@ impl Backend {
+ 
+         let rt = self.runtime_handle();
+         let client = self.web_client();
++        #[cfg(not(target_os = "watchos"))]
+         let auth2 = auth.clone();
+ 
+         let ret = self.with_col(|col| {
+@@ -383,6 +392,7 @@ impl Backend {
+ 
+         let output: SyncOutput = ret?;
+ 
++        #[cfg(not(target_os = "watchos"))]
+         if input.sync_media
+             && !matches!(output.required, SyncActionRequired::FullSyncRequired { .. })
+         {
+@@ -405,7 +415,10 @@ impl Backend {
+         upload: bool,
+     ) -> Result<()> {
+         let auth: SyncAuth = input.try_into()?;
++        #[cfg(not(target_os = "watchos"))]
+         let auth2 = auth.clone();
++        #[cfg(target_os = "watchos")]
++        let _ = server_usn;
+         self.abort_media_sync_and_wait();
+ 
+         let rt = self.runtime_handle();
+@@ -449,6 +462,7 @@ impl Backend {
+             Err(_) => Err(AnkiError::Interrupted),
+         };
+ 
++        #[cfg(not(target_os = "watchos"))]
+         if result.is_ok() && server_usn.is_some() {
+             self.sync_media_in_background(auth2, server_usn)?;
+         }
+diff --git a/rslib/src/sync/http_client/io_monitor.rs b/rslib/src/sync/http_client/io_monitor.rs
+index 602b672dde6e7779dd1a92c8cb1241e109e4a957..900e358976e7e5e6f7702fc89c309f0a9e0f398f 100644
+--- a/rslib/src/sync/http_client/io_monitor.rs
++++ b/rslib/src/sync/http_client/io_monitor.rs
+@@ -28,8 +28,16 @@ use crate::error::Result;
+ use crate::sync::error::HttpError;
+ use crate::sync::error::HttpResult;
+ use crate::sync::error::OrHttpErr;
++#[cfg(any(test, target_os = "watchos"))]
++use crate::sync::http_client::transport::BufferedRequest;
++#[cfg(any(test, target_os = "watchos"))]
++use crate::sync::http_client::transport::BufferedResponse;
++#[cfg(any(test, target_os = "watchos"))]
++use crate::sync::http_client::transport::BufferedTransport;
+ use crate::sync::request::header_and_stream::decode_zstd_body_stream_for_client;
+ use crate::sync::request::header_and_stream::encode_zstd_body_stream;
++#[cfg(any(test, target_os = "watchos"))]
++use crate::sync::request::header_and_stream::SYNC_HEADER_NAME;
+ use crate::sync::response::ORIGINAL_SIZE;
+ 
+ /// Serves two purposes:
+@@ -155,6 +163,79 @@ impl IoMonitor {
+             }
+         }
+     }
++
++    #[cfg(any(test, target_os = "watchos"))]
++    pub(super) async fn buffered_zstd_request_with_timeout(
++        &self,
++        transport: &dyn BufferedTransport,
++        url: reqwest::Url,
++        sync_header: String,
++        request_body: Vec<u8>,
++        stall_duration: Duration,
++    ) -> HttpResult<Vec<u8>> {
++        let request_total = u32::try_from(request_body.len()).unwrap_or(u32::MAX);
++        let request_stream = encode_zstd_body_stream(self.wrap_stream(
++            true,
++            request_total,
++            ReaderStream::new(Cursor::new(request_body)),
++        ));
++        let request_body = request_stream
++            .try_fold(Vec::new(), |mut output, bytes| async move {
++                output.extend_from_slice(&bytes);
++                Ok(output)
++            })
++            .await?;
++        let mut headers = reqwest::header::HeaderMap::new();
++        headers.insert(
++            CONTENT_TYPE,
++            reqwest::header::HeaderValue::from_static("application/octet-stream"),
++        );
++        headers.insert(
++            SYNC_HEADER_NAME.clone(),
++            reqwest::header::HeaderValue::from_str(&sync_header)
++                .or_internal_err("invalid sync header")?,
++        );
++        let request = BufferedRequest {
++            url,
++            headers,
++            body: request_body,
++            timeout_secs: u32::try_from(stall_duration.as_secs()).unwrap_or(u32::MAX),
++        };
++        let response = transport.send(request).await?;
++        self.decode_buffered_response(response).await
++    }
++
++    #[cfg(any(test, target_os = "watchos"))]
++    async fn decode_buffered_response(&self, response: BufferedResponse) -> HttpResult<Vec<u8>> {
++        map_buffered_redirect_to_error(&response)?;
++        if !response.status.is_success() {
++            return Err(HttpError::new_without_source(
++                response.status,
++                "HTTP request failed",
++            ));
++        }
++        let response_total = response
++            .headers
++            .get(&ORIGINAL_SIZE)
++            .and_then(|value| value.to_str().ok())
++            .and_then(|value| value.parse::<u32>().ok())
++            .or_bad_request("missing original size")?;
++        let compressed = futures::stream::iter([Ok::<_, HttpError>(Bytes::from(response.body))]);
++        let response_stream = self.wrap_stream(
++            false,
++            response_total,
++            decode_zstd_body_stream_for_client(compressed),
++        );
++        let mut reader = StreamReader::new(response_stream.map_err(|error| {
++            std::io::Error::new(ErrorKind::ConnectionAborted, format!("{error}"))
++        }));
++        let mut output = Vec::with_capacity(response_total as usize);
++        reader
++            .read_to_end(&mut output)
++            .await
++            .or_http_err(StatusCode::SEE_OTHER, "reading stream")?;
++        Ok(output)
++    }
+ }
+ 
+ /// Reqwest can't retry a redirected request as the body has been consumed, so
+@@ -172,6 +253,20 @@ fn map_redirect_to_error(resp: &Response) -> HttpResult<()> {
+     Ok(())
+ }
+ 
++#[cfg(any(test, target_os = "watchos"))]
++fn map_buffered_redirect_to_error(resp: &BufferedResponse) -> HttpResult<()> {
++    if resp.status == StatusCode::PERMANENT_REDIRECT {
++        let location = resp
++            .headers
++            .get(LOCATION)
++            .or_bad_request("missing location header")?;
++        let location = String::from_utf8(location.as_bytes().to_vec())
++            .or_bad_request("location was not in utf8")?;
++        None.or_permanent_redirect(location)?;
++    }
++    Ok(())
++}
++
+ #[derive(Debug)]
+ pub struct IoMonitorInner {
+     last_activity: Instant,
+diff --git a/rslib/src/sync/http_client/mod.rs b/rslib/src/sync/http_client/mod.rs
+index 7366cfbbe9d33d20d1506a4d09bccffb61deae79..b151ffe8aff9dc05bec59543b381fd8b5c7ce09f 100644
+--- a/rslib/src/sync/http_client/mod.rs
++++ b/rslib/src/sync/http_client/mod.rs
+@@ -3,10 +3,20 @@
+ 
+ pub(crate) mod full_sync;
+ pub(crate) mod io_monitor;
++#[cfg(target_os = "watchos")]
++mod platform;
+ mod protocol;
++#[cfg(any(test, target_os = "watchos"))]
++mod transport;
++
++#[cfg(test)]
++mod transport_contract_test;
+ 
+ use std::time::Duration;
+ 
++#[cfg(any(test, target_os = "watchos"))]
++use std::sync::Arc;
++
+ use reqwest::Client;
+ use reqwest::Error;
+ use reqwest::StatusCode;
+@@ -16,6 +26,7 @@ use crate::notes;
+ use crate::sync::collection::protocol::AsSyncEndpoint;
+ use crate::sync::error::HttpError;
+ use crate::sync::error::HttpResult;
++use crate::sync::error::OrHttpErr;
+ use crate::sync::http_client::io_monitor::IoMonitor;
+ use crate::sync::login::SyncAuth;
+ use crate::sync::request::header_and_stream::SyncHeader;
+@@ -23,12 +34,17 @@ use crate::sync::request::header_and_stream::SYNC_HEADER_NAME;
+ use crate::sync::request::SyncRequest;
+ use crate::sync::response::SyncResponse;
+ 
++#[cfg(target_os = "watchos")]
++pub use platform::complete_request;
++
+ #[derive(Clone)]
+ pub struct HttpSyncClient {
+     /// Set to the empty string for initial login
+     pub sync_key: String,
+     session_key: String,
+     client: Client,
++    #[cfg(any(test, target_os = "watchos"))]
++    buffered_transport: Option<Arc<dyn transport::BufferedTransport>>,
+     pub endpoint: Url,
+     pub io_timeout: Duration,
+ }
+@@ -40,6 +56,10 @@ impl HttpSyncClient {
+             sync_key: auth.hkey,
+             session_key: simple_session_id(),
+             client,
++            #[cfg(target_os = "watchos")]
++            buffered_transport: Some(Arc::new(platform::WatchTransport)),
++            #[cfg(all(test, not(target_os = "watchos")))]
++            buffered_transport: None,
+             endpoint: auth
+                 .endpoint
+                 .unwrap_or_else(|| Url::try_from("https://sync.ankiweb.net/").unwrap()),
+@@ -69,16 +89,38 @@ impl HttpSyncClient {
+         };
+         let data = request.data;
+         let url = method.as_sync_endpoint(&self.endpoint);
+-        let request = self
+-            .client
+-            .post(url)
+-            .header(&SYNC_HEADER_NAME, serde_json::to_string(&header).unwrap());
++        let sync_header =
++            serde_json::to_string(&header).or_internal_err("serializing sync header")?;
++        #[cfg(any(test, target_os = "watchos"))]
++        if let Some(transport) = &self.buffered_transport {
++            return io_monitor
++                .buffered_zstd_request_with_timeout(
++                    transport.as_ref(),
++                    url,
++                    sync_header,
++                    data,
++                    self.io_timeout,
++                )
++                .await
++                .map(SyncResponse::from_vec);
++        }
++        let request = self.client.post(url).header(&SYNC_HEADER_NAME, sync_header);
+         io_monitor
+             .zstd_request_with_timeout(request, data, self.io_timeout)
+             .await
+             .map(SyncResponse::from_vec)
+     }
+ 
++    #[cfg(test)]
++    fn new_with_buffered_transport(
++        auth: SyncAuth,
++        transport: Arc<dyn transport::BufferedTransport>,
++    ) -> Self {
++        let mut client = Self::new(auth, Client::new());
++        client.buffered_transport = Some(transport);
++        client
++    }
++
+     #[cfg(test)]
+     pub(crate) fn endpoint(&self) -> &Url {
+         &self.endpoint
+diff --git a/rslib/src/sync/http_client/platform.rs b/rslib/src/sync/http_client/platform.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..30e90cdf27991d41014fa8c71044a04f7e0653a1
+--- /dev/null
++++ b/rslib/src/sync/http_client/platform.rs
+@@ -0,0 +1,154 @@
++// Copyright: Ankitects Pty Ltd and contributors
++// License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
++
++use std::collections::HashMap;
++use std::sync::atomic::AtomicU64;
++use std::sync::atomic::Ordering;
++use std::sync::LazyLock;
++use std::sync::Mutex;
++
++use async_trait::async_trait;
++use axum::http::HeaderMap;
++use axum::http::HeaderValue;
++use reqwest::StatusCode;
++use tokio::sync::oneshot;
++
++use super::transport::BufferedRequest;
++use super::transport::BufferedResponse;
++use super::transport::BufferedTransport;
++use crate::sync::error::HttpError;
++use crate::sync::error::HttpResult;
++use crate::sync::request::header_and_stream::SYNC_HEADER_NAME;
++use crate::sync::response::ORIGINAL_SIZE;
++
++type PendingRequest = oneshot::Sender<HttpResult<BufferedResponse>>;
++
++static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
++static PENDING_REQUESTS: LazyLock<Mutex<HashMap<u64, PendingRequest>>> =
++    LazyLock::new(|| Mutex::new(HashMap::new()));
++
++extern "C" {
++    fn anki_swift_http_request(
++        request_id: u64,
++        url_data: *const u8,
++        url_len: usize,
++        header_data: *const u8,
++        header_len: usize,
++        body_data: *const u8,
++        body_len: usize,
++        timeout_secs: u32,
++    );
++    fn anki_swift_http_cancel(request_id: u64);
++}
++
++pub(super) struct WatchTransport;
++
++#[async_trait]
++impl BufferedTransport for WatchTransport {
++    async fn send(&self, request: BufferedRequest) -> HttpResult<BufferedResponse> {
++        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
++        let (sender, receiver) = oneshot::channel();
++        PENDING_REQUESTS.lock().unwrap().insert(request_id, sender);
++        let _cancellation = CancellationGuard { request_id };
++        let url = request.url.as_str().as_bytes();
++        let Some(sync_header) = request.headers.get(&SYNC_HEADER_NAME) else {
++            return Err(HttpError::new_without_source(
++                StatusCode::INTERNAL_SERVER_ERROR,
++                "buffered sync request missing sync header",
++            ));
++        };
++        let sync_header = sync_header.as_bytes();
++        // SAFETY: Category 8 (FFI boundary). All pointers describe immutable
++        // buffers that remain alive for this synchronous call. The Swift ABI
++        // copies every buffer before returning and retains none of the pointers.
++        unsafe {
++            anki_swift_http_request(
++                request_id,
++                url.as_ptr(),
++                url.len(),
++                sync_header.as_ptr(),
++                sync_header.len(),
++                request.body.as_ptr(),
++                request.body.len(),
++                request.timeout_secs,
++            )
++        };
++        receiver.await.unwrap_or_else(|_| {
++            Err(HttpError::new_without_source(
++                StatusCode::BAD_GATEWAY,
++                "native transport completion channel closed",
++            ))
++        })
++    }
++}
++
++struct CancellationGuard {
++    request_id: u64,
++}
++
++impl Drop for CancellationGuard {
++    fn drop(&mut self) {
++        if PENDING_REQUESTS
++            .lock()
++            .unwrap()
++            .remove(&self.request_id)
++            .is_some()
++        {
++            // SAFETY: Category 8 (FFI boundary). The request id is an opaque
++            // value allocated here, and the Swift ABI accepts cancellation for
++            // unknown or already-completed ids as a no-op.
++            unsafe { anki_swift_http_cancel(self.request_id) };
++        }
++    }
++}
++
++pub fn complete_request(
++    request_id: u64,
++    status_code: u16,
++    original_size: i64,
++    location: Option<&[u8]>,
++    body: Vec<u8>,
++    native_error: Option<&[u8]>,
++) -> bool {
++    let Some(sender) = PENDING_REQUESTS.lock().unwrap().remove(&request_id) else {
++        return false;
++    };
++    let response = make_response(status_code, original_size, location, body, native_error);
++    sender.send(response).is_ok()
++}
++
++fn make_response(
++    status_code: u16,
++    original_size: i64,
++    location: Option<&[u8]>,
++    body: Vec<u8>,
++    native_error: Option<&[u8]>,
++) -> HttpResult<BufferedResponse> {
++    if let Some(error) = native_error {
++        return Err(HttpError::new_without_source(
++            StatusCode::BAD_GATEWAY,
++            format!("native transport: {}", String::from_utf8_lossy(error)),
++        ));
++    }
++    let status = StatusCode::from_u16(status_code).map_err(|_| {
++        HttpError::new_without_source(StatusCode::BAD_GATEWAY, "invalid native HTTP status")
++    })?;
++    let mut headers = HeaderMap::new();
++    if original_size >= 0 {
++        let value = HeaderValue::from_str(&original_size.to_string()).map_err(|_| {
++            HttpError::new_without_source(StatusCode::BAD_GATEWAY, "invalid original size")
++        })?;
++        headers.insert(ORIGINAL_SIZE.clone(), value);
++    }
++    if let Some(location) = location {
++        let value = HeaderValue::from_bytes(location).map_err(|_| {
++            HttpError::new_without_source(StatusCode::BAD_GATEWAY, "invalid redirect location")
++        })?;
++        headers.insert(reqwest::header::LOCATION, value);
++    }
++    Ok(BufferedResponse {
++        status,
++        headers,
++        body,
++    })
++}
+diff --git a/rslib/src/sync/http_client/transport.rs b/rslib/src/sync/http_client/transport.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a455d5f9f80a31e90a37885465b99f6a7b5b6fd
+--- /dev/null
++++ b/rslib/src/sync/http_client/transport.rs
+@@ -0,0 +1,27 @@
++// Copyright: Ankitects Pty Ltd and contributors
++// License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
++
++use async_trait::async_trait;
++use axum::http::HeaderMap;
++use reqwest::StatusCode;
++use reqwest::Url;
++
++use crate::sync::error::HttpResult;
++
++pub(super) struct BufferedRequest {
++    pub url: Url,
++    pub headers: HeaderMap,
++    pub body: Vec<u8>,
++    pub timeout_secs: u32,
++}
++
++pub(super) struct BufferedResponse {
++    pub status: StatusCode,
++    pub headers: HeaderMap,
++    pub body: Vec<u8>,
++}
++
++#[async_trait]
++pub(super) trait BufferedTransport: Send + Sync {
++    async fn send(&self, request: BufferedRequest) -> HttpResult<BufferedResponse>;
++}
+diff --git a/rslib/src/sync/http_client/transport_contract_test.rs b/rslib/src/sync/http_client/transport_contract_test.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb6e0bd47690f8426801f0aa7830cb186de57016
+--- /dev/null
++++ b/rslib/src/sync/http_client/transport_contract_test.rs
+@@ -0,0 +1,250 @@
++// Copyright: Ankitects Pty Ltd and contributors
++// License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
++
++use std::io::Cursor;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::time::Duration;
++
++use async_trait::async_trait;
++use axum::http::HeaderMap;
++use axum::http::HeaderValue;
++use futures::future::pending;
++use reqwest::StatusCode;
++use reqwest::Url;
++use serde_json::Value;
++use tokio::sync::Notify;
++use wiremock::matchers::method;
++use wiremock::matchers::path;
++use wiremock::Mock;
++use wiremock::MockServer;
++use wiremock::ResponseTemplate;
++
++use super::transport::BufferedRequest;
++use super::transport::BufferedResponse;
++use super::transport::BufferedTransport;
++use super::HttpSyncClient;
++use crate::sync::collection::protocol::SyncProtocol;
++use crate::sync::error::HttpResult;
++use crate::sync::login::HostKeyRequest;
++use crate::sync::request::header_and_stream::SYNC_HEADER_NAME;
++use crate::sync::request::IntoSyncRequest;
++use crate::sync::response::ORIGINAL_SIZE;
++
++const REQUEST_USER: &str = "transport-contract-user";
++const REQUEST_PASSWORD: &str = "transport-contract-password";
++const RESPONSE_KEY: &str = "transport-contract-host-key";
++
++struct FakeTransport {
++    response: Mutex<Option<HttpResult<BufferedResponse>>>,
++    request: Mutex<Option<BufferedRequest>>,
++}
++
++#[async_trait]
++impl BufferedTransport for FakeTransport {
++    async fn send(&self, request: BufferedRequest) -> HttpResult<BufferedResponse> {
++        self.request.lock().unwrap().replace(request);
++        self.response.lock().unwrap().take().unwrap()
++    }
++}
++
++struct BlockingTransport {
++    started: Arc<Notify>,
++    cancelled: Arc<AtomicUsize>,
++}
++
++struct CancelGuard(Arc<AtomicUsize>);
++
++impl Drop for CancelGuard {
++    fn drop(&mut self) {
++        self.0.fetch_add(1, Ordering::SeqCst);
++    }
++}
++
++#[async_trait]
++impl BufferedTransport for BlockingTransport {
++    async fn send(&self, _request: BufferedRequest) -> HttpResult<BufferedResponse> {
++        let _cancel_guard = CancelGuard(self.cancelled.clone());
++        self.started.notify_one();
++        pending().await
++    }
++}
++
++struct DelayedTransport {
++    response: Mutex<Option<HttpResult<BufferedResponse>>>,
++}
++
++#[async_trait]
++impl BufferedTransport for DelayedTransport {
++    async fn send(&self, _request: BufferedRequest) -> HttpResult<BufferedResponse> {
++        tokio::time::sleep(Duration::from_millis(1_100)).await;
++        self.response.lock().unwrap().take().unwrap()
++    }
++}
++
++fn request() -> crate::sync::request::SyncRequest<HostKeyRequest> {
++    HostKeyRequest {
++        username: REQUEST_USER.into(),
++        password: REQUEST_PASSWORD.into(),
++    }
++    .try_into_sync_request()
++    .unwrap()
++}
++
++fn compressed_response(status: StatusCode, body: &[u8]) -> BufferedResponse {
++    let mut headers = HeaderMap::new();
++    headers.insert(
++        ORIGINAL_SIZE.clone(),
++        HeaderValue::from_str(&body.len().to_string()).unwrap(),
++    );
++    BufferedResponse {
++        status,
++        headers,
++        body: zstd::stream::encode_all(Cursor::new(body), 0).unwrap(),
++    }
++}
++
++#[tokio::test]
++async fn buffered_transport_preserves_sync_request_and_response_contract() {
++    // Given
++    let fake = Arc::new(FakeTransport {
++        response: Mutex::new(Some(Ok(compressed_response(
++            StatusCode::OK,
++            format!(r#"{{"key":"{RESPONSE_KEY}"}}"#).as_bytes(),
++        )))),
++        request: Mutex::new(None),
++    });
++    let auth = crate::sync::login::SyncAuth {
++        hkey: "transport-contract-sync-key".into(),
++        endpoint: Some(Url::parse("https://example.invalid/base/").unwrap()),
++        io_timeout_secs: Some(5),
++    };
++    let mut client = HttpSyncClient::new_with_buffered_transport(auth, fake.clone());
++    client.set_skey("transport-contract-session".into());
++
++    // When
++    let response = client.host_key(request()).await.unwrap().json().unwrap();
++
++    // Then
++    assert_eq!(response.key, RESPONSE_KEY);
++    let captured = fake.request.lock().unwrap().take().unwrap();
++    assert_eq!(
++        captured.url.as_str(),
++        "https://example.invalid/base/sync/hostKey"
++    );
++    assert_eq!(
++        captured.headers.get("content-type").unwrap(),
++        "application/octet-stream"
++    );
++    assert_eq!(captured.timeout_secs, 5);
++    let sync_header: Value =
++        serde_json::from_slice(captured.headers.get(&SYNC_HEADER_NAME).unwrap().as_bytes())
++            .unwrap();
++    assert_eq!(sync_header["k"], "transport-contract-sync-key");
++    assert_eq!(sync_header["s"], "transport-contract-session");
++    let decoded = zstd::stream::decode_all(Cursor::new(captured.body)).unwrap();
++    let body: Value = serde_json::from_slice(&decoded).unwrap();
++    assert_eq!(body["u"], REQUEST_USER);
++    assert_eq!(body["p"], REQUEST_PASSWORD);
++}
++
++#[tokio::test]
++async fn buffered_transport_surfaces_http_status_without_following_redirect() {
++    // Given
++    let mut response = compressed_response(StatusCode::PERMANENT_REDIRECT, b"");
++    response.headers.insert(
++        "location",
++        HeaderValue::from_static("https://sync2.example.invalid/"),
++    );
++    let fake = Arc::new(FakeTransport {
++        response: Mutex::new(Some(Ok(response))),
++        request: Mutex::new(None),
++    });
++    let auth = crate::sync::login::SyncAuth {
++        endpoint: Some(Url::parse("https://example.invalid/").unwrap()),
++        ..Default::default()
++    };
++    let client = HttpSyncClient::new_with_buffered_transport(auth, fake);
++
++    // When
++    let error = client.host_key(request()).await.unwrap_err();
++
++    // Then
++    assert_eq!(error.code, StatusCode::PERMANENT_REDIRECT);
++    assert_eq!(error.context, "https://sync2.example.invalid/");
++}
++
++#[tokio::test]
++async fn buffered_transport_cancellation_drops_the_in_flight_request_once() {
++    // Given
++    let started = Arc::new(Notify::new());
++    let cancelled = Arc::new(AtomicUsize::new(0));
++    let fake = Arc::new(BlockingTransport {
++        started: started.clone(),
++        cancelled: cancelled.clone(),
++    });
++    let client =
++        HttpSyncClient::new_with_buffered_transport(crate::sync::login::SyncAuth::default(), fake);
++
++    // When
++    let task = tokio::spawn(async move { client.host_key(request()).await });
++    started.notified().await;
++    task.abort();
++    let _ = task.await;
++
++    // Then
++    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
++}
++
++#[tokio::test]
++async fn buffered_transport_relies_on_native_activity_timeout() {
++    // Given
++    let body = format!(r#"{{"key":"{RESPONSE_KEY}"}}"#);
++    let fake = Arc::new(DelayedTransport {
++        response: Mutex::new(Some(Ok(compressed_response(
++            StatusCode::OK,
++            body.as_bytes(),
++        )))),
++    });
++    let auth = crate::sync::login::SyncAuth {
++        io_timeout_secs: Some(1),
++        ..Default::default()
++    };
++    let client = HttpSyncClient::new_with_buffered_transport(auth, fake);
++
++    // When
++    let response = client.host_key(request()).await.unwrap().json().unwrap();
++
++    // Then
++    assert_eq!(response.key, RESPONSE_KEY);
++}
++
++#[tokio::test]
++async fn default_client_keeps_the_reqwest_transport() {
++    // Given
++    let server = MockServer::start().await;
++    let body = format!(r#"{{"key":"{RESPONSE_KEY}"}}"#);
++    let compressed = zstd::stream::encode_all(Cursor::new(body.as_bytes()), 0).unwrap();
++    Mock::given(method("POST"))
++        .and(path("/sync/hostKey"))
++        .respond_with(
++            ResponseTemplate::new(200)
++                .insert_header(ORIGINAL_SIZE.as_str(), body.len().to_string().as_str())
++                .set_body_bytes(compressed),
++        )
++        .mount(&server)
++        .await;
++    let auth = crate::sync::login::SyncAuth {
++        endpoint: Some(Url::parse(&format!("{}/", server.uri())).unwrap()),
++        ..Default::default()
++    };
++    let client = HttpSyncClient::new(auth, reqwest::Client::new());
++
++    // When
++    let response = client.host_key(request()).await.unwrap().json().unwrap();
++
++    // Then
++    assert_eq!(response.key, RESPONSE_KEY);
++}

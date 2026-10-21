@@ -122,6 +122,47 @@ pub unsafe extern "C" fn anki_close_backend(backend_ptr: i64) {
     }
 }
 
+/// Complete a watchOS URLSession request without re-entering the backend RPC.
+///
+/// # Safety
+/// Each non-null pointer must describe a readable buffer of its matching
+/// length for the duration of this call. Null is valid only for absent or
+/// empty buffers.
+#[cfg(target_os = "watchos")]
+#[no_mangle]
+pub unsafe extern "C" fn anki_http_complete(
+    request_id: u64,
+    status_code: u16,
+    original_size: i64,
+    location_data: *const u8,
+    location_len: usize,
+    body_data: *const u8,
+    body_len: usize,
+    error_data: *const u8,
+    error_len: usize,
+) -> c_int {
+    let location = match optional_ffi_bytes(location_data, location_len) {
+        Ok(bytes) => bytes,
+        Err(()) => return -1,
+    };
+    let body = match ffi_bytes(body_data, body_len) {
+        Ok(bytes) => bytes.to_vec(),
+        Err(()) => return -1,
+    };
+    let native_error = match optional_ffi_bytes(error_data, error_len) {
+        Ok(bytes) => bytes,
+        Err(()) => return -1,
+    };
+    i32::from(anki::sync::http_client::complete_request(
+        request_id,
+        status_code,
+        original_size,
+        location,
+        body,
+        native_error,
+    ))
+}
+
 // -- Helpers --
 
 unsafe fn set_output(data: Vec<u8>, out_data: *mut *mut u8, out_len: *mut usize) {
@@ -140,4 +181,25 @@ unsafe fn set_output(data: Vec<u8>, out_data: *mut *mut u8, out_len: *mut usize)
             *out_len = 0;
         }
     }
+}
+
+#[cfg(target_os = "watchos")]
+fn ffi_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8], ()> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if data.is_null() {
+        return Err(());
+    }
+    // SAFETY: Category 8 (FFI boundary). The exported function's contract
+    // requires a readable buffer of exactly `len` bytes, and null was rejected.
+    Ok(unsafe { slice::from_raw_parts(data, len) })
+}
+
+#[cfg(target_os = "watchos")]
+fn optional_ffi_bytes<'a>(data: *const u8, len: usize) -> Result<Option<&'a [u8]>, ()> {
+    if data.is_null() {
+        return if len == 0 { Ok(None) } else { Err(()) };
+    }
+    ffi_bytes(data, len).map(Some)
 }

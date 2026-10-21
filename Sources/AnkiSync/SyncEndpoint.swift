@@ -13,6 +13,8 @@ public import Foundation
 /// sync settings — and each carried its own copy of the scheme handling,
 /// so a fix to one never reached the other two.
 public enum SyncEndpoint: Sendable {
+    public static let official = "https://sync.ankiweb.net/"
+
     public enum ValidationError: LocalizedError, Sendable {
         case empty
         case insecureScheme
@@ -35,11 +37,10 @@ public enum SyncEndpoint: Sendable {
 
     /// Trims, defaults a missing scheme to https, and rejects cleartext.
     ///
-    /// The `http://` rejection matters more than it looks: App Transport
-    /// Security does not cover this traffic. ATS governs
-    /// NSURLSession/CFNetwork, but sync goes out through the Rust HTTP
-    /// client inside AnkiRustLib, so the platform provides no backstop
-    /// here — credentials really would travel in the clear.
+    /// The `http://` rejection matters more than it looks: non-watch sync
+    /// goes out through the Rust HTTP client, where App Transport Security
+    /// provides no backstop. The watch transport uses URLSession, but shares
+    /// this validation so every platform rejects cleartext credentials.
     public static func normalized(_ raw: String) throws(ValidationError) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw .empty }
@@ -50,6 +51,13 @@ public enum SyncEndpoint: Sendable {
         let withScheme = lowered.hasPrefix("https://") ? trimmed : "https://" + trimmed
         guard let url = URL(string: withScheme), url.host?.isEmpty == false else {
             throw .malformed
+        }
+        if url.host?.lowercased() == "sync.ankiweb.net",
+           url.port == nil,
+           url.path.isEmpty || url.path == "/",
+           url.query == nil,
+           url.fragment == nil {
+            return official
         }
         return withScheme
     }

@@ -51,4 +51,21 @@ void anki_free_response(uint8_t *data, size_t len);
  */
 void anki_close_backend(int64_t backend_ptr);
 
+/**
+ * Complete a watchOS URLSession request started by the Rust sync transport.
+ * Returns 1 when delivered, 0 when the request was already cancelled or
+ * completed, and -1 when a pointer/length pair is invalid.
+ */
+int anki_http_complete(
+    uint64_t request_id,
+    uint16_t status_code,
+    int64_t original_size,
+    const uint8_t *location_data,
+    size_t location_len,
+    const uint8_t *body_data,
+    size_t body_len,
+    const uint8_t *error_data,
+    size_t error_len
+);
+
 #endif /* ANKI_BRIDGE_H */

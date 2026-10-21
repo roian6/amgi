@@ -18,7 +18,7 @@ public struct WatchLoginView: View {
     @Dependency(\.syncClient) private var syncClient
     @State private var username = ""
     @State private var password = ""
-    @State private var endpoint = ""
+    @State private var endpoint = SyncEndpoint.official
     /// Form submission state. `showLoginFields` used to sit here too and was
     /// never read.
     enum SubmissionState {
@@ -43,7 +43,6 @@ public struct WatchLoginView: View {
             loginFieldsView
         }
         .onAppear {
-            // Prefill endpoint from keychain if available
             if let saved = KeychainHelper.loadEndpoint() {
                 endpoint = saved
             }
@@ -81,21 +80,16 @@ public struct WatchLoginView: View {
     }
     private func login() async {
         submission = .submitting
-        // Persist endpoint if provided
-        let ep = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ep.isEmpty {
-            // Ignore errors here; login flow should still proceed
-            try? KeychainHelper.saveEndpoint(ep)
-        }
         do {
+            let normalizedEndpoint = try SyncEndpoint.normalized(endpoint)
+            try KeychainHelper.saveEndpoint(normalizedEndpoint)
             _ = try await SyncClient.login(username: username, password: password)
-            // Initial sync to get the collection
             _ = try await syncClient.sync()
             submission = .idle
             onLoginSuccess()
         } catch {
             logger.error("Login failed: \(error)")
-            submission = .failed("Login failed. Check your credentials.")
+            submission = .failed(error.localizedDescription)
         }
     }
 }

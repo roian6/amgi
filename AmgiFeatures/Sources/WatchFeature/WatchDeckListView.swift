@@ -14,6 +14,26 @@ import SwiftUI
 
 private let logger = Logger(subsystem: "com.amgiapp.AmgiApp", category: "WatchDeckList")
 
+struct WatchSyncPresentation: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let message: String
+
+    static let success = WatchSyncPresentation(
+        id: "success",
+        title: "Sync Complete",
+        message: "Your collection is up to date."
+    )
+
+    static func failure(_ error: any Error) -> WatchSyncPresentation {
+        WatchSyncPresentation(
+            id: "failure",
+            title: "Sync Failed",
+            message: error.localizedDescription
+        )
+    }
+}
+
 struct WatchDeckListView: View {
     @Dependency(\.deckClient) var deckClient
     @Dependency(\.syncClient) var syncClient
@@ -41,6 +61,7 @@ struct WatchDeckListView: View {
     @State private var isSyncing = false
     @State private var destination: Destination?
     @State private var rows: [FlattenedItem] = []
+    @State private var syncPresentation: WatchSyncPresentation?
 
     private var tree: [DeckTreeNode] {
         if case .loaded(let tree) = state { return tree }
@@ -121,6 +142,9 @@ struct WatchDeckListView: View {
                         destination = nil
                         Task { await sync() }
                     }
+                    Text("Cards only; media is not synced on Watch.")
+                        .font(.caption2)
+                        .multilineTextAlignment(.center)
                     Button("Switch Account") {
                         destination = .login
                     }
@@ -133,6 +157,13 @@ struct WatchDeckListView: View {
                 })
             }
         }
+        .alert(item: $syncPresentation) { presentation in
+            Alert(
+                title: Text(presentation.title),
+                message: Text(presentation.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
         .task {
             await loadDecks()
         }
@@ -140,13 +171,15 @@ struct WatchDeckListView: View {
 
     private func sync() async {
         isSyncing = true
+        defer { isSyncing = false }
         do {
             _ = try await syncClient.sync()
             await loadDecks()
+            syncPresentation = .success
         } catch {
             logger.error("Sync error: \(error)")
+            syncPresentation = .failure(error)
         }
-        isSyncing = false
     }
 
     private var isLoadingDecks: Bool {

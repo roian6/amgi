@@ -111,6 +111,11 @@ let package = Package(
             ],
             swiftSettings: interopSwiftSettings
         ),
+        .testTarget(
+            name: "AnkiBackendTests",
+            dependencies: ["AnkiBackend"],
+            swiftSettings: interopSwiftSettings
+        ),
         .target(
             name: "AnkiProtoBridge",
             dependencies: [

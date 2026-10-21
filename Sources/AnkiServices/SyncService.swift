@@ -33,7 +33,12 @@ extension SyncService: DependencyKey {
                 var auth = SyncAuth(hkey: hostKey, endpoint: endpoint)
 
                 do {
-                    let result = try await backend.invoke(.syncCollection(auth: auth, syncMedia: true))
+                    #if os(watchOS)
+                    let syncMedia = false
+                    #else
+                    let syncMedia = true
+                    #endif
+                    let result = try await backend.invoke(.syncCollection(auth: auth, syncMedia: syncMedia))
                     logger.info("SyncCollection: required=\(result.required), message='\(result.serverMessage)'")
 
                     if let newEndpoint = result.newEndpoint {
@@ -109,11 +114,12 @@ extension SyncService: DependencyKey {
                     let hkey = try await backend.invoke(.syncLogin(
                         endpoint: endpoint, username: username, password: password
                     ))
-                    logger.info("Login successful for \(username)")
+                    logger.info("Login successful")
                     return hkey
                 } catch let error as BackendError {
                     logger.error("Login failed: \(error.message)")
-                    throw SyncError.authFailed
+                    if error.isSyncAuthError { throw SyncError.authFailed }
+                    throw SyncError(message: error.message)
                 }
             }
         )

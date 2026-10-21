@@ -147,7 +147,7 @@ extension SyncClient: DependencyKey {
     ) async throws -> String {
         @Dependency(\.syncService) var syncService
 
-        logger.info("Logging in as \(username)")
+        logger.info("Starting login")
         let endpoint = KeychainHelper.loadEndpoint() ?? ""
         let hostKey = try await syncService.login(endpoint, username, password)
         try KeychainHelper.saveHostKey(hostKey)

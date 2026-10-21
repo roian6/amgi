@@ -7,6 +7,8 @@
 
 import AnkiBackend
 import AnkiSync
+import Compression
+import CryptoKit
 import Dependencies
 import Foundation
 import Sharing
@@ -75,6 +77,7 @@ struct WatchApp: App {
             ).first ?? URL.applicationSupportDirectory
             let ankiDir = appSupport.appendingPathComponent("AnkiCollection", isDirectory: true)
             try FileManager.default.createDirectory(at: ankiDir, withIntermediateDirectories: true)
+            try installStagedCollectionIfPresent(appSupport: appSupport, ankiDir: ankiDir)
             let collectionPath = ankiDir.appendingPathComponent("collection.anki2").path
             let mediaPath = ankiDir.appendingPathComponent("media").path
             let mediaDbPath = ankiDir.appendingPathComponent("media.db").path
@@ -88,5 +91,141 @@ struct WatchApp: App {
             )
             $0.ankiBackend = backend
         }
+    }
+
+    private struct SeedManifest: Decodable {
+        let version: Int
+        let byteCount: Int
+        let sha256: String
+        let parts: [String]
+        let compression: String?
+    }
+
+    private static func installStagedCollectionIfPresent(
+        appSupport: URL,
+        ankiDir: URL
+    ) throws {
+        let fileManager = FileManager.default
+        let stagingDir = appSupport.appendingPathComponent("AnkiSeedStaging", isDirectory: true)
+        let manifestURL = stagingDir.appendingPathComponent("manifest.json")
+        guard fileManager.fileExists(atPath: manifestURL.path) else { return }
+
+        let manifest = try JSONDecoder().decode(
+            SeedManifest.self,
+            from: Data(contentsOf: manifestURL)
+        )
+        guard manifest.version == 1, manifest.byteCount > 0, !manifest.parts.isEmpty else {
+            throw NSError(
+                domain: "AmgiWatchSeed",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid staged collection manifest."]
+            )
+        }
+
+        let temporaryURL = ankiDir.appendingPathComponent("collection.anki2.seed")
+        if fileManager.fileExists(atPath: temporaryURL.path) {
+            try fileManager.removeItem(at: temporaryURL)
+        }
+        guard fileManager.createFile(atPath: temporaryURL.path, contents: nil) else {
+            throw NSError(
+                domain: "AmgiWatchSeed",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Could not create staged collection file."]
+            )
+        }
+
+        for partName in manifest.parts {
+            guard (partName as NSString).lastPathComponent == partName else {
+                throw NSError(
+                    domain: "AmgiWatchSeed",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid staged collection part name."]
+                )
+            }
+        }
+
+        let output = try FileHandle(forWritingTo: temporaryURL)
+        var hasher = SHA256()
+        var written = 0
+        do {
+            if manifest.compression == "zlib" {
+                var partIndex = 0
+                var currentInput: FileHandle?
+                let filter = try InputFilter<Data>(
+                    .decompress,
+                    using: .zlib,
+                    readingFrom: { requestedCount in
+                        while true {
+                            if currentInput == nil {
+                                guard partIndex < manifest.parts.count else { return nil }
+                                currentInput = try FileHandle(
+                                    forReadingFrom: stagingDir.appendingPathComponent(
+                                        manifest.parts[partIndex]
+                                    )
+                                )
+                                partIndex += 1
+                            }
+                            if let data = try currentInput?.read(upToCount: requestedCount),
+                               !data.isEmpty {
+                                return data
+                            }
+                            try currentInput?.close()
+                            currentInput = nil
+                        }
+                    }
+                )
+                defer { try? currentInput?.close() }
+                while let data = try filter.readData(ofLength: 1_048_576) {
+                    hasher.update(data: data)
+                    try output.write(contentsOf: data)
+                    written += data.count
+                }
+            } else if manifest.compression == nil {
+                for partName in manifest.parts {
+                    let input = try FileHandle(
+                        forReadingFrom: stagingDir.appendingPathComponent(partName)
+                    )
+                    while let data = try input.read(upToCount: 1_048_576), !data.isEmpty {
+                        hasher.update(data: data)
+                        try output.write(contentsOf: data)
+                        written += data.count
+                    }
+                    try input.close()
+                }
+            } else {
+                throw NSError(
+                    domain: "AmgiWatchSeed",
+                    code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: "Unsupported staged collection compression."]
+                )
+            }
+            try output.synchronize()
+            try output.close()
+        } catch {
+            try? output.close()
+            try? fileManager.removeItem(at: temporaryURL)
+            throw error
+        }
+
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        guard written == manifest.byteCount, digest == manifest.sha256.lowercased() else {
+            try? fileManager.removeItem(at: temporaryURL)
+            throw NSError(
+                domain: "AmgiWatchSeed",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Staged collection verification failed."]
+            )
+        }
+
+        let collectionURL = ankiDir.appendingPathComponent("collection.anki2")
+        for url in [
+            collectionURL,
+            ankiDir.appendingPathComponent("collection.anki2-wal"),
+            ankiDir.appendingPathComponent("collection.anki2-shm"),
+        ] where fileManager.fileExists(atPath: url.path) {
+            try fileManager.removeItem(at: url)
+        }
+        try fileManager.moveItem(at: temporaryURL, to: collectionURL)
+        try fileManager.removeItem(at: stagingDir)
     }
 }

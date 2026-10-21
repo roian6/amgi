@@ -1,0 +1,35 @@
+{
+  "base": "e64c6b1aee3e8d668fb8bbe084beada8e070d985",
+  "source_tip": "b551992648d391558694411fe236c9fd91ff4ec4",
+  "source_commits": [
+    "02a3f4ab9bbe1d9e4555d8bdadd075f6e1c2c70f",
+    "b551992648d391558694411fe236c9fd91ff4ec4"
+  ],
+  "files": {
+    "rslib/src/backend/sync.rs": {
+      "mode": "100644",
+      "blob": "2f2870469cd95d8d1a67dd0ad9e9c9d2af94aa1d"
+    },
+    "rslib/src/sync/http_client/io_monitor.rs": {
+      "mode": "100644",
+      "blob": "900e358976e7e5e6f7702fc89c309f0a9e0f398f"
+    },
+    "rslib/src/sync/http_client/mod.rs": {
+      "mode": "100644",
+      "blob": "b151ffe8aff9dc05bec59543b381fd8b5c7ce09f"
+    },
+    "rslib/src/sync/http_client/platform.rs": {
+      "mode": "100644",
+      "blob": "30e90cdf27991d41014fa8c71044a04f7e0653a1"
+    },
+    "rslib/src/sync/http_client/transport.rs": {
+      "mode": "100644",
+      "blob": "0a455d5f9f80a31e90a37885465b99f6a7b5b6fd"
+    },
+    "rslib/src/sync/http_client/transport_contract_test.rs": {
+      "mode": "100644",
+      "blob": "fb6e0bd47690f8426801f0aa7830cb186de57016"
+    }
+  },
+  "patch_sha256": "5dbffa7b50c6ab3282bb3eed0582a5f0715312d5d4371bcc6c08a488af651697"
+}

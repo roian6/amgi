@@ -10,6 +10,7 @@ import AnkiBackend
 import AnkiKit
 import Dependencies
 import AmgiCardWeb
+import Foundation
 import SwiftUI
 import ReviewCore
 
@@ -35,7 +36,7 @@ struct WatchReviewView: View {
             } else {
                 VStack(spacing: 0) {
                     ScrollView {
-                        CardTextView(html: currentHTML)
+                        CardTextView(html: currentHTML, css: session.cardCSS, mediaFolder: session.mediaFolder)
                     }
                     if session.showAnswer {
                         HStack(spacing: 0) {
@@ -119,12 +120,53 @@ struct WatchReviewView: View {
     }
 }
 
-private struct CardTextView: View {
-    let html: String
+struct CardTextView: View {
+    let document: WatchCardDocument
+    let content: NativeCardContent
+    @State private var richText: WatchCardRichText?
+
+    init(html: String, css: String = "", mediaFolder: URL? = nil) {
+        document = WatchCardDocument(html: html, css: css, mediaFolder: mediaFolder)
+        content = NativeCardContent.parse(html: document.fallbackHTML)
+    }
 
     var body: some View {
-        Text(CardText.plainText(html))
-            .font(.title3)
-            .multilineTextAlignment(.center)
+        Group {
+            if let richText, richText.document == document {
+                VStack(spacing: 0) {
+                    ForEach(Array(richText.paragraphs.enumerated()), id: \.offset) { _, paragraph in
+                        Text(paragraph.text)
+                            .multilineTextAlignment(paragraph.alignment)
+                            .frame(maxWidth: .infinity, alignment: paragraph.frameAlignment)
+                            .padding(.top, paragraph.spaceBefore)
+                            .padding(.bottom, paragraph.spaceAfter)
+                    }
+                }
+            } else {
+                fallback
+            }
+        }
+        .task(id: document) {
+            richText = WatchCardRichText(document: document)
+        }
+    }
+
+    private var fallback: some View {
+        VStack(spacing: 8) {
+            ForEach(Array(content.blocks.enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .text(let attributed):
+                    Text(attributed)
+                        .font(.title3)
+                        .multilineTextAlignment(.center)
+                case .divider:
+                    Divider()
+                case .image(let filename):
+                    Image(systemName: "photo")
+                        .accessibilityLabel("Image: \(filename)")
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
     }
 }

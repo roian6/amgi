@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 BRIDGE_DIR="$ROOT_DIR/anki-bridge-rs"
+python3 "$ROOT_DIR/scripts/apply-watch-anki-patch.py"
 OUTPUT_DIR="$ROOT_DIR/AnkiRustLib.xcframework"
 STAGE_DIR="$BRIDGE_DIR/target/xcframework-stage"
 HEADER="$BRIDGE_DIR/include/anki_bridge.h"
@@ -24,13 +25,13 @@ export DESCRIPTORS_BIN="$BRIDGE_DIR/target/anki_descriptors.bin"
 export IPHONEOS_DEPLOYMENT_TARGET="17.0"
 export WATCHOS_DEPLOYMENT_TARGET="11.0"
 
-# The crate is a cdylib, not a staticlib, and it ships as a *dynamic* framework.
-# That is load-bearing for SwiftUI previews: XCPreviewAgent JIT-links a package
-# target against the dylibs in the products dir, so a static archive's symbols
-# (anki_open_backend & friends) are simply absent and every preview that
-# transitively reaches AnkiBackend dies with
+# The iOS slices ship as dynamic frameworks. That is load-bearing for SwiftUI
+# previews: XCPreviewAgent JIT-links a package target against the dylibs in the
+# products dir, so a static archive's symbols (anki_open_backend & friends) are
+# simply absent and every preview that transitively reaches AnkiBackend dies with
 #   JITError: Symbols not found: [_anki_open_backend, ...]
-# Do not switch this back to `staticlib` without re-breaking that.
+# The watchOS slices are static so their Rust-to-Swift URLSession callbacks are
+# resolved when the final app links, rather than while creating a Rust dylib.
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-install_name,@rpath/AnkiRustLib.framework/AnkiRustLib"
 
 # watchOS is a tier-3 Rust target: std isn't distributed, so we build it from
@@ -52,28 +53,52 @@ cargo build \
     --target aarch64-apple-ios-sim \
     --release
 
-echo "==> Building for watchOS simulator (aarch64-apple-watchos-sim, build-std)..."
-# ponytail: sim slice only. The watchOS *device* target is arm64_32-apple-watchos
-# (ILP32); add it here the same way once a physical-watch build is actually needed.
+MANIFEST="$BRIDGE_DIR/Cargo.toml"
+MANIFEST_BACKUP="$BRIDGE_DIR/target/Cargo.toml.pre-watch"
+cp "$MANIFEST" "$MANIFEST_BACKUP"
+restore_manifest() { cp "$MANIFEST_BACKUP" "$MANIFEST"; rm -f "$MANIFEST_BACKUP"; }
+trap restore_manifest EXIT INT TERM
+python3 - "$MANIFEST" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+old = 'crate-type = ["cdylib"]'
+assert s.count(old) == 1
+p.write_text(s.replace(old, 'crate-type = ["staticlib"]'))
+PY
+
+echo "==> Building for watchOS simulator (aarch64-apple-watchos-sim, staticlib, build-std)..."
 cargo "+$NIGHTLY" build \
     -Z build-std=std,panic_abort \
-    --manifest-path "$BRIDGE_DIR/Cargo.toml" \
+    --manifest-path "$MANIFEST" \
     --target aarch64-apple-watchos-sim \
     --release
 
-# Wrap one cdylib into AnkiRustLib.framework. $1 = rust triple, $2 = slice name,
-# $3 = CFBundleSupportedPlatforms entry, $4 = MinimumOSVersion.
+echo "==> Building for watchOS device (aarch64-apple-watchos, staticlib, build-std)..."
+cargo "+$NIGHTLY" build \
+    -Z build-std=std,panic_abort \
+    --manifest-path "$MANIFEST" \
+    --target aarch64-apple-watchos \
+    --release
+restore_manifest
+trap - EXIT INT TERM
+
+# Wrap one Rust library into AnkiRustLib.framework. $1 = rust triple,
+# $2 = slice name, $3 = CFBundleSupportedPlatforms entry,
+# $4 = MinimumOSVersion, $5 = library filename (defaults to cdylib).
 make_framework() {
     local triple="$1" slice="$2" platform="$3" minos="$4"
-    local dylib="$BRIDGE_DIR/target/$triple/release/libanki_bridge_ios.dylib"
-    [ -f "$dylib" ] || { echo "ERROR: dylib not found at $dylib"; exit 1; }
+    local library_name="${5:-libanki_bridge_ios.dylib}"
+    local library="$BRIDGE_DIR/target/$triple/release/$library_name"
+    [ -f "$library" ] || { echo "ERROR: library not found at $library"; exit 1; }
 
     local fw="$STAGE_DIR/$slice/AnkiRustLib.framework"
     rm -rf "$fw"
 
     local root="$fw" plist_dir="$fw"
     mkdir -p "$root/Headers" "$root/Modules"
-    cp "$dylib" "$root/AnkiRustLib"
+    cp "$library" "$root/AnkiRustLib"
     cp "$HEADER" "$root/Headers/"
 
     cat > "$root/Modules/module.modulemap" <<'MODULEMAP'
@@ -109,7 +134,8 @@ echo "==> Staging frameworks..."
 rm -rf "$STAGE_DIR"
 make_framework aarch64-apple-ios            ios-device  iPhoneOS        "$IPHONEOS_DEPLOYMENT_TARGET"
 make_framework aarch64-apple-ios-sim        ios-sim     iPhoneSimulator "$IPHONEOS_DEPLOYMENT_TARGET"
-make_framework aarch64-apple-watchos-sim    watchos-sim WatchSimulator  "$WATCHOS_DEPLOYMENT_TARGET"
+make_framework aarch64-apple-watchos-sim    watchos-sim WatchSimulator  "$WATCHOS_DEPLOYMENT_TARGET" libanki_bridge_ios.a
+make_framework aarch64-apple-watchos        watchos-device WatchOS      "$WATCHOS_DEPLOYMENT_TARGET" libanki_bridge_ios.a
 
 echo "==> Packaging XCFramework..."
 rm -rf "$OUTPUT_DIR"
@@ -117,6 +143,7 @@ xcodebuild -create-xcframework \
     -framework "$STAGE_DIR/ios-device/AnkiRustLib.framework" \
     -framework "$STAGE_DIR/ios-sim/AnkiRustLib.framework" \
     -framework "$STAGE_DIR/watchos-sim/AnkiRustLib.framework" \
+    -framework "$STAGE_DIR/watchos-device/AnkiRustLib.framework" \
     -output "$OUTPUT_DIR"
 
 echo "==> Restoring cargo binaries over the packaged ones (LINKEDIT alignment)..."
@@ -141,7 +168,8 @@ restore_binary() {
 
 restore_binary aarch64-apple-ios         ios-arm64
 restore_binary aarch64-apple-ios-sim     ios-arm64-simulator
-restore_binary aarch64-apple-watchos-sim watchos-arm64-simulator
+# The watchOS slices are static archives and do not need dynamic-library
+# LINKEDIT restoration/alignment checks.
 
 echo "==> Done! XCFramework at: $OUTPUT_DIR"
 echo "==> Contents:"
