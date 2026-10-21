@@ -20,6 +20,23 @@ final class CardAssetScheme: NSObject, WKURLSchemeHandler {
     /// running on every asset a card referenced.
     @Dependency(\.mediaClient) private var mediaClient
 
+    static func accessControlAllowOrigin(for request: URLRequest) -> String? {
+        guard let documentURL = request.mainDocumentURL,
+              documentURL.scheme?.lowercased() == CardAssetPath.scheme,
+              documentURL.host?.lowercased() == "card",
+              let origin = request.value(forHTTPHeaderField: "Origin") else {
+            return nil
+        }
+
+        // WebKit may serialize non-HTTP custom-scheme origins as opaque
+        // (`null`) or as their scheme/host pair. In both cases the
+        // mainDocumentURL check above binds the grant to card HTML rather than
+        // to an HTTP(S) page navigated inside the same WKWebView.
+        if origin == "null" { return origin }
+        let cardOrigin = "\(CardAssetPath.scheme)://card"
+        return origin.caseInsensitiveCompare(cardOrigin) == .orderedSame ? origin : nil
+    }
+
     func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
         guard let url = urlSchemeTask.request.url else {
             urlSchemeTask.didFailWithError(URLError(.badURL))
@@ -78,15 +95,21 @@ private extension CardAssetScheme {
         mimeType: String,
         data: Data
     ) {
+        var headerFields = [
+            "Content-Type": mimeType,
+            "Content-Length": String(data.count),
+            "Cache-Control": "no-cache",
+        ]
+        if let origin = Self.accessControlAllowOrigin(for: task.request) {
+            headerFields["Access-Control-Allow-Origin"] = origin
+            headerFields["Vary"] = "Origin"
+        }
+
         guard let response = HTTPURLResponse(
             url: url,
             statusCode: statusCode,
             httpVersion: "HTTP/1.1",
-            headerFields: [
-                "Content-Type": mimeType,
-                "Content-Length": String(data.count),
-                "Cache-Control": "no-cache",
-            ]
+            headerFields: headerFields
         ) else {
             task.didFailWithError(URLError(.badServerResponse))
             return

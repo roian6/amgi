@@ -20,8 +20,15 @@ public enum ReaderThemeMode: String, CaseIterable, Identifiable {
 public enum ReviewPreferences {
     public enum Keys {
         public static let playAudioInSilentMode = "review_pref_play_audio_in_silent_mode"
+        public static let audioAutoplay = "review_pref_audio_autoplay"
+        public static let answerAudio = "review_pref_answer_audio"
+        public static let zoomScale = "review_pref_zoom_scale"
+        public static let answerZoom = "review_pref_answer_zoom"
         public static let showCorrectnessSymbols = "review_pref_show_correctness_symbols"
         public static let showAnswerButtons = "review_pref_show_answer_buttons"
+        public static let tapControls = "review_pref_tap_controls"
+        public static let gamepadControls = "review_pref_gamepad_controls"
+        public static let reviewInputSettings = "review_pref_input_settings"
         public static let cardRenderEngine = "review_pref_card_render_engine"
         public static let templateRenderOverrides = "review_pref_template_render_overrides"
         public static let showRemainingDays = "review_pref_show_remaining_days"
@@ -33,6 +40,72 @@ public enum ReviewPreferences {
         public static let cardContentAlignment = "review_pref_card_content_alignment"
         public static let glassAnswerButtons = "review_pref_glass_answer_buttons"
         public static let autoMatchCardBackground = "review_pref_auto_match_card_background"
+    }
+}
+
+package enum ReviewAutoplayPolicy: String, CaseIterable, Identifiable, Sendable {
+    case enabled
+    case disabled
+
+    package static let defaultValue = Self.enabled
+
+    package var id: String { rawValue }
+
+    package static func resolved(_ rawValue: String) -> Self {
+        Self(rawValue: rawValue) ?? defaultValue
+    }
+}
+
+package enum ReviewAnswerAudioPolicy: String, CaseIterable, Identifiable, Sendable {
+    case questionAndAnswer
+    case answerOnly
+
+    package static let defaultValue = Self.questionAndAnswer
+
+    package var id: String { rawValue }
+
+    package static func resolved(_ rawValue: String) -> Self {
+        Self(rawValue: rawValue) ?? defaultValue
+    }
+}
+
+package enum ReviewAnswerZoomPolicy: String, CaseIterable, Identifiable, Sendable {
+    case keep
+    case reset
+
+    package static let defaultValue = Self.keep
+
+    package var id: String { rawValue }
+    package var shouldResetOnAnswer: Bool { self == .reset }
+
+    package static func resolved(_ rawValue: String) -> Self {
+        Self(rawValue: rawValue) ?? defaultValue
+    }
+}
+
+package enum ReviewZoomPolicy {
+    package static let minimumScale = 0.7
+    package static let maximumScale = 2.0
+    package static let defaultScale = 1.0
+    package static let step = 0.1
+
+    package static func clamped(_ scale: Double) -> Double {
+        min(max(scale, minimumScale), maximumScale)
+    }
+
+    package static func increased(from scale: Double) -> Double {
+        stepped(scale, by: step)
+    }
+
+    package static func decreased(from scale: Double) -> Double {
+        stepped(scale, by: -step)
+    }
+
+    package static func reset() -> Double { defaultScale }
+
+    private static func stepped(_ scale: Double, by delta: Double) -> Double {
+        let value = clamped(scale + delta)
+        return (value * 10).rounded() / 10
     }
 }
 

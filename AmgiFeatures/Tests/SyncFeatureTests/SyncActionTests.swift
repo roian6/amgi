@@ -7,6 +7,7 @@
 
 import Testing
 import SwiftUI
+import AppShared
 @testable import SyncFeature
 
 @Suite @MainActor struct SyncActionTests {
@@ -22,12 +23,15 @@ import SwiftUI
     /// SyncFlowModifier holds one instance in @State across evaluations.
     @Test func actionsWithTheSameToastCompareEqual() {
         let toast = SyncToastController()
-        #expect(SyncAction(toast: toast) == SyncAction(toast: toast))
+        #expect(SyncAction(identity: toast) {} == SyncAction(identity: toast) {})
     }
 
     /// Different controllers must NOT compare equal, or a real change would be
     /// silently swallowed. Guards against an `==` that returns true blindly.
     @Test func actionsWithDifferentToastsDiffer() {
-        #expect(SyncAction(toast: SyncToastController()) != SyncAction(toast: SyncToastController()))
+        #expect(
+            SyncAction(identity: SyncToastController()) {}
+                != SyncAction(identity: SyncToastController()) {}
+        )
     }
 }

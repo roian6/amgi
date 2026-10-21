@@ -34,6 +34,14 @@ struct ReviewContent: View {
     let cardContentAlignment: String
     let tapLookup: Bool
     let showNextReviewTime: Bool
+    let tapControlsEnabled: Bool
+    let gamepadControlsEnabled: Bool
+    let reviewInputSettings: ReviewInputSettings
+    let showAnswerButtons: Bool
+    let audioAutoplayPolicy: ReviewAutoplayPolicy
+    let answerAudioPolicy: ReviewAnswerAudioPolicy
+    @Binding var zoomScale: Double
+    let answerZoomPolicy: ReviewAnswerZoomPolicy
     @Binding var destination: ReviewDestination?
     let onDismiss: () -> Void
 
@@ -43,10 +51,11 @@ struct ReviewContent: View {
     @Environment(\.lookupPopup) private var lookupPopup
     @State private var cardActions = CardContextMenuModel()
     @State private var confirmDeleteNote = false
+    @State private var isCardActionsMenuPresented = false
     @State private var lookupHighlight = LookupHighlight()
 
     private var keyboardActive: Bool {
-        destination == nil && !confirmDeleteNote
+        destination == nil && !confirmDeleteNote && !isCardActionsMenuPresented
     }
 
     var body: some View {
@@ -71,6 +80,14 @@ struct ReviewContent: View {
                         cardContentAlignment: cardContentAlignment,
                         tapLookup: tapLookup,
                         showNextReviewTime: showNextReviewTime,
+                        tapControlsEnabled: tapControlsEnabled,
+                        gamepadControlsEnabled: gamepadControlsEnabled,
+                        reviewInputSettings: reviewInputSettings,
+                        showAnswerButtons: showAnswerButtons,
+                        audioAutoplayPolicy: audioAutoplayPolicy,
+                        answerAudioPolicy: answerAudioPolicy,
+                        zoomScale: $zoomScale,
+                        answerZoomPolicy: answerZoomPolicy,
                         lookupHighlight: lookupHighlight,
                         shortcutsEnabled: keyboardActive,
                         lookupQuery: $destination.lookupText
@@ -99,14 +116,18 @@ struct ReviewContent: View {
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
+                    ReviewZoomControls(scale: $zoomScale)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     ReviewUndoButton(session: session, shortcutEnabled: keyboardActive)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    CardActionsMenu(
+                    CardActionsButton(
                         session: session,
                         cardActions: cardActions,
                         destination: $destination,
-                        confirmDeleteNote: $confirmDeleteNote
+                        confirmDeleteNote: $confirmDeleteNote,
+                        isPresented: $isCardActionsMenuPresented
                     )
                 }
             }
@@ -167,12 +188,14 @@ struct ReviewContent: View {
             if showRemainingDays {
                 ReviewPositionCounter(session: session)
             }
+            ReviewZoomControls(scale: $zoomScale)
             ReviewUndoButton(session: session, shortcutEnabled: keyboardActive)
-            CardActionsMenu(
+            CardActionsButton(
                 session: session,
                 cardActions: cardActions,
                 destination: $destination,
-                confirmDeleteNote: $confirmDeleteNote
+                confirmDeleteNote: $confirmDeleteNote,
+                isPresented: $isCardActionsMenuPresented
             )
         }
         .buttonStyle(.plain)
@@ -285,69 +308,46 @@ private struct ReviewUndoButton: View {
     }
 }
 
+private struct ReviewZoomControls: View {
+    @Binding var scale: Double
+
+    var body: some View {
+        Menu {
+            Button("Zoom Out", systemImage: "minus.magnifyingglass") {
+                scale = ReviewZoomPolicy.decreased(from: scale)
+            }
+            .disabled(scale <= ReviewZoomPolicy.minimumScale)
+
+            Button("Reset Zoom", systemImage: "arrow.counterclockwise") {
+                scale = ReviewZoomPolicy.reset()
+            }
+
+            Button("Zoom In", systemImage: "plus.magnifyingglass") {
+                scale = ReviewZoomPolicy.increased(from: scale)
+            }
+            .disabled(scale >= ReviewZoomPolicy.maximumScale)
+        } label: {
+            Image(systemName: "textformat.size")
+        }
+        .accessibilityLabel("Card zoom")
+        .accessibilityValue("\(Int(ReviewZoomPolicy.clamped(scale) * 100)) percent")
+    }
+}
+
 // MARK: - Card actions
 
-private struct CardActionsMenu: View {
+private struct CardActionsButton: View {
     let session: ReviewSession
     let cardActions: CardContextMenuModel
     @Binding var destination: ReviewDestination?
     @Binding var confirmDeleteNote: Bool
+    @Binding var isPresented: Bool
 
     @Environment(\.palette) private var palette
 
     var body: some View {
-        Menu {
-            if let cardId = session.currentCardId {
-                CardFlagPicker(model: cardActions, cardId: cardId)
-            }
-
-            Section {
-                Button {
-                    destination = session.currentNote.map(ReviewDestination.editNote)
-                } label: {
-                    Label("Edit Note", systemImage: "pencil")
-                }
-                .disabled(session.currentNote == nil)
-
-                Button {
-                    destination = session.currentTemplateTarget.map(ReviewDestination.editTemplate)
-                } label: {
-                    Label("Edit Template", systemImage: "square.and.pencil")
-                }
-                .disabled(session.currentTemplateTarget == nil)
-
-                Button {
-                    // Empty initial query opens the popup focused for typing.
-                    // Future enhancement: forward CardWebView text-selection so
-                    // the query is pre-populated.
-                    destination = .lookup("")
-                } label: {
-                    Label("Look Up", systemImage: "character.book.closed")
-                }
-
-                Button {
-                    if session.isAudioPlaying {
-                        session.bumpStopAudioRequest()
-                    } else {
-                        session.bumpReplayRequest()
-                    }
-                } label: {
-                    Label(
-                        session.isAudioPlaying ? "Stop Audio" : "Replay Audio",
-                        systemImage: session.isAudioPlaying ? "pause.circle" : "play.circle"
-                    )
-                }
-                .disabled(session.currentNote == nil)
-            }
-
-            if let cardId = session.currentCardId {
-                CardActionSections(
-                    model: cardActions,
-                    cardId: cardId,
-                    noteId: session.currentNote?.id,
-                    confirmDeleteNote: $confirmDeleteNote
-                )
-            }
+        Button {
+            isPresented = true
         } label: {
             Image(systemName: "ellipsis.circle")
                 .foregroundStyle(
@@ -357,6 +357,92 @@ private struct CardActionsMenu: View {
                 )
         }
         .accessibilityLabel("Card actions")
+        .popover(isPresented: $isPresented) {
+            NavigationStack {
+                Form { actionItems }
+                    .navigationTitle("Card Actions")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { isPresented = false }
+                        }
+                    }
+            }
+            .frame(minWidth: 320, idealWidth: 380, minHeight: 480)
+            .presentationCompactAdaptation(.sheet)
+        }
+    }
+
+    @ViewBuilder
+    private var actionItems: some View {
+        if let cardId = session.currentCardId {
+            CardFlagPicker(
+                model: cardActions,
+                cardId: cardId,
+                onSelection: { isPresented = false },
+                onAction: { _ in isPresented = false }
+            )
+        }
+
+        Section {
+            Button {
+                present(session.currentNote.map(ReviewDestination.editNote))
+            } label: {
+                Label("Edit Note", systemImage: "pencil")
+            }
+            .disabled(session.currentNote == nil)
+
+            Button {
+                present(session.currentTemplateTarget.map(ReviewDestination.editTemplate))
+            } label: {
+                Label("Edit Template", systemImage: "square.and.pencil")
+            }
+            .disabled(session.currentTemplateTarget == nil)
+
+            Button {
+                // Empty initial query opens the popup focused for typing.
+                // Future enhancement: forward CardWebView text-selection so
+                // the query is pre-populated.
+                present(.lookup(""))
+            } label: {
+                Label("Look Up", systemImage: "character.book.closed")
+            }
+
+            Button {
+                if session.isAudioPlaying {
+                    session.bumpStopAudioRequest()
+                } else {
+                    session.bumpReplayRequest()
+                }
+                isPresented = false
+            } label: {
+                Label(
+                    session.isAudioPlaying ? "Stop Audio" : "Replay Audio",
+                    systemImage: session.isAudioPlaying ? "pause.circle" : "play.circle"
+                )
+            }
+            .disabled(session.currentNote == nil)
+        }
+
+        if let cardId = session.currentCardId {
+            CardActionSections(
+                model: cardActions,
+                cardId: cardId,
+                noteId: session.currentNote?.id,
+                confirmDeleteNote: $confirmDeleteNote,
+                onSelection: { isPresented = false },
+                onAction: { _ in isPresented = false }
+            )
+        }
+    }
+
+    private func present(_ nextDestination: ReviewDestination?) {
+        guard let nextDestination else { return }
+        isPresented = false
+        Task { @MainActor in
+            await Task.yield()
+            destination = nextDestination
+        }
     }
 }
 
@@ -446,6 +532,14 @@ private struct ReviewFinishedView: View {
         cardContentAlignment: CardWebViewContentAlignment.center.rawValue,
         tapLookup: true,
         showNextReviewTime: true,
+        tapControlsEnabled: false,
+        gamepadControlsEnabled: false,
+        reviewInputSettings: .legacyAmgi,
+        showAnswerButtons: true,
+        audioAutoplayPolicy: .enabled,
+        answerAudioPolicy: .questionAndAnswer,
+        zoomScale: .constant(1),
+        answerZoomPolicy: .keep,
         destination: .constant(nil),
         onDismiss: {}
     )
@@ -460,6 +554,14 @@ private struct ReviewFinishedView: View {
         cardContentAlignment: CardWebViewContentAlignment.center.rawValue,
         tapLookup: true,
         showNextReviewTime: true,
+        tapControlsEnabled: false,
+        gamepadControlsEnabled: false,
+        reviewInputSettings: .legacyAmgi,
+        showAnswerButtons: true,
+        audioAutoplayPolicy: .enabled,
+        answerAudioPolicy: .questionAndAnswer,
+        zoomScale: .constant(1),
+        answerZoomPolicy: .keep,
         destination: .constant(nil),
         onDismiss: {}
     )
@@ -474,6 +576,14 @@ private struct ReviewFinishedView: View {
         cardContentAlignment: CardWebViewContentAlignment.center.rawValue,
         tapLookup: true,
         showNextReviewTime: true,
+        tapControlsEnabled: false,
+        gamepadControlsEnabled: false,
+        reviewInputSettings: .legacyAmgi,
+        showAnswerButtons: true,
+        audioAutoplayPolicy: .enabled,
+        answerAudioPolicy: .questionAndAnswer,
+        zoomScale: .constant(1),
+        answerZoomPolicy: .keep,
         destination: .constant(nil),
         onDismiss: {}
     )

@@ -46,6 +46,8 @@ public final class ReviewSession {
     public private(set) var canUndo: Bool = false
     public private(set) var nextIntervals: [Rating: String] = [:]
     public private(set) var replayRequestID: Int = 0       // plumbed; consumer is PR 1b
+    public private(set) var replayCardID: CardID?
+    public private(set) var replayIsAnswerSide: Bool?
     public private(set) var stopAudioRequestID: Int = 0    // plumbed; consumer is PR 1b
     public private(set) var isAudioPlaying: Bool = false
     public private(set) var currentNote: NoteRecord?
@@ -326,6 +328,8 @@ public final class ReviewSession {
     }
 
     public func bumpReplayRequest() {
+        replayCardID = currentCardId
+        replayIsAnswerSide = showAnswer
         replayRequestID += 1
     }
 

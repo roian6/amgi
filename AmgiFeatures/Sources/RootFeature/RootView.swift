@@ -95,8 +95,6 @@ public struct RootView: View {
         } message: {
             Text(accountStore.switchFailure ?? "")
         }
-        // still drives the tabs not yet on CollectionStore
-        .syncFlow { refreshID = UUID() }
         .deckImport(isPresented: $showImport) {
             store.invalidateAll()
             refreshID = UUID()
@@ -107,7 +105,10 @@ public struct RootView: View {
                 store.invalidateAll()
                 refreshID = UUID()
             }
+            .syncFlow { refreshID = UUID() }
         }
+        // still drives the tabs not yet on CollectionStore
+        .syncFlow(presentsFeedback: pendingReviewDeckId == nil) { refreshID = UUID() }
         .environment(\.lookupPopup, ReaderLookupPopup())
         .environment(\.dictionarySettings, ReaderDictionarySettings())
     }

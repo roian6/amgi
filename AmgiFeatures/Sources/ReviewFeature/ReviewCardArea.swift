@@ -34,17 +34,66 @@ struct ReviewCardArea: View {
     let cardContentAlignment: String
     let tapLookup: Bool
     let showNextReviewTime: Bool
+    let tapControlsEnabled: Bool
+    let gamepadControlsEnabled: Bool
+    let reviewInputSettings: ReviewInputSettings
+    let showAnswerButtons: Bool
+    let audioAutoplayPolicy: ReviewAutoplayPolicy
+    let answerAudioPolicy: ReviewAnswerAudioPolicy
+    @Binding var zoomScale: Double
+    let answerZoomPolicy: ReviewAnswerZoomPolicy
     let lookupHighlight: LookupHighlight
     let shortcutsEnabled: Bool
     @Binding var lookupQuery: String?
 
     @Environment(\.palette) private var palette
+    @Environment(\.accessibilityVoiceOverEnabled) private var isVoiceOverEnabled
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.startSync) private var startSync
     @Shared(.appStorage(ReaderPreferences.Keys.dictionaryScanLength))
     private var dictionaryScanLength: Int = 16
     @State private var showRenderModeSheet = false
     @State private var nativeAudioPlayer = NativeCardAudioPlayer()
+    @State private var gamepadMonitor = ReviewGamepadMonitor()
+    @State private var isAnswerTransitioning = false
+    @State private var isWebEditableFocused = false
+    @State private var showSyncUnavailable = false
+    @State private var scrollRequestID = 0
+    @State private var scrollDirection = ReviewScrollDirection.down
+    @State private var continuousScrollDelta: CGFloat?
+    @State private var userActionRequestID = 0
+    @State private var userActionIndex: Int?
+    @State private var userActionCardID: CardID?
+    @State private var userActionIsAnswerSide: Bool?
 
     private var mediaFolder: URL? { session.mediaFolder }
+    private var tapControlsAvailable: Bool {
+        ReviewTapPolicy.tapControlsAvailable(
+            preferenceEnabled: tapControlsEnabled,
+            isTypedAnswerCard: session.isTypedAnswerCard,
+            isVoiceOverEnabled: isVoiceOverEnabled
+        )
+    }
+
+    private var reviewShortcutsActive: Bool {
+        shortcutsEnabled && !showRenderModeSheet && session.answerError == nil
+    }
+
+    private var shouldShowRatingButtons: Bool {
+        ReviewTapPolicy.showsRatingButtons(
+            isShowingAnswer: session.showAnswer,
+            preferenceEnabled: showAnswerButtons,
+            tapControlsEnabled: tapControlsEnabled,
+            gamepadControlsEnabled: gamepadControlsEnabled,
+            isGamepadConnected: gamepadMonitor.hasConnectedController,
+            gamepadHasRatingAction: ReviewInputReachability.hasRatingAction(
+                in: reviewInputSettings,
+                availableInputs: gamepadMonitor.availableInputs
+            ),
+            isTypedAnswerCard: session.isTypedAnswerCard,
+            isVoiceOverEnabled: isVoiceOverEnabled
+        )
+    }
 
     var body: some View {
         if session.currentCardId == nil {
@@ -83,29 +132,50 @@ struct ReviewCardArea: View {
             .padding(.horizontal)
 
             cardFlipRegion
+            .frame(maxWidth: .infinity)
             .onChange(of: session.stopAudioRequestID) { _, _ in
-                if isNativeMode { nativeAudioPlayer.stop() }
+                nativeAudioPlayer.stop()
             }
-            .onChange(of: session.currentCardId) { _, _ in playNativeAudio() }
+            .onChange(of: session.currentCardId) { _, _ in
+                isWebEditableFocused = false
+                userActionIndex = nil
+                userActionCardID = nil
+                userActionIsAnswerSide = nil
+                nativeAudioPlayer.stop()
+                playNativeAudio(automatic: true)
+            }
             .onChange(of: session.showAnswer) { _, shown in
-                if shown { playNativeAudio() }
+                guard shown else { return }
+                nativeAudioPlayer.stop()
+                if answerZoomPolicy.shouldResetOnAnswer {
+                    zoomScale = ReviewZoomPolicy.reset()
+                }
+                playNativeAudio(automatic: true)
             }
-            .onChange(of: session.replayRequestID) { _, _ in playNativeAudio() }
+            .onChange(of: session.replayRequestID) { _, _ in
+                playNativeAudio(automatic: false)
+            }
             .onChange(of: nativeAudioPlayer.isPlaying) { _, playing in
                 if isNativeMode { session.updateAudioPlaying(playing) }
             }
             .onDisappear { nativeAudioPlayer.stop() }
             .sheet(isPresented: $showRenderModeSheet) { renderModeSheet }
 
-            Spacer()
+            if ReviewTapPolicy.needsBottomControlSpacer(
+                isShowingAnswer: session.showAnswer,
+                showsRatingButtons: shouldShowRatingButtons,
+                isTypedAnswerCard: session.isTypedAnswerCard
+            ) {
+                Spacer()
+            }
 
             if session.isTypedAnswerCard {
                 TypedAnswerField(session: session)
             }
 
-            if session.showAnswer {
+            if shouldShowRatingButtons {
                 answerButtons
-            } else {
+            } else if !session.showAnswer {
                 Button {
                     session.revealAnswer()
                 } label: {
@@ -120,6 +190,22 @@ struct ReviewCardArea: View {
             }
         }
         .animation(AmgiMotion.quick, value: session.showAnswer)
+        .onAppear { updateGamepadMonitoring() }
+        .onChange(of: gamepadControlsEnabled) { _, _ in updateGamepadMonitoring() }
+        .onChange(of: gamepadMonitor.inputCount) { _, _ in
+            for event in gamepadMonitor.drainInputs() {
+                handleGamepadInput(event)
+            }
+        }
+        .onChange(of: gamepadMonitor.axisFrameCount) { _, _ in
+            handleGamepadAxisFrames(gamepadMonitor.drainAxisFrames())
+        }
+        .onDisappear { gamepadMonitor.stop() }
+        .alert("Sync unavailable", isPresented: $showSyncUnavailable) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Sync isn't available from this review session. Close the reviewer and check your sync setup.")
+        }
     }
 
     private var isNativeMode: Bool {
@@ -128,7 +214,7 @@ struct ReviewCardArea: View {
     }
 
     private var keyboardActive: Bool {
-        shortcutsEnabled && !showRenderModeSheet && !session.isTypedAnswerCard
+        reviewShortcutsActive && !session.isTypedAnswerCard
     }
 
     /// The reveal region. Native cards get the 3D flip (pure SwiftUI, crisp);
@@ -174,25 +260,44 @@ struct ReviewCardArea: View {
     private func cardSurface(isBack: Bool) -> some View {
         switch session.resolvedMode {
         case .native(let front, let back):
-            NativeCardView(
-                content: isBack ? back : front,
-                isAnswerSide: isBack,
-                mediaFolder: mediaFolder
-            )
+            nativeCardSurface(content: isBack ? back : front, isBack: isBack)
+                .frame(maxWidth: ReviewLayoutPolicy.maximumContentWidth(
+                    isRegularWidth: horizontalSizeClass == .regular
+                ))
+                .frame(maxWidth: .infinity)
         case .html:
             VStack(spacing: 0) {
                 CardWebView(
                     html: isBack ? session.backHTML : session.frontHTML,
+                    cardID: session.currentCardId,
                     cardCSS: session.cardCSS,
+                    autoplayEnabled: audioAutoplayPolicy == .enabled,
+                    zoomScale: zoomScale,
+                    maximumContentWidth: ReviewLayoutPolicy.maximumContentWidth(
+                        isRegularWidth: horizontalSizeClass == .regular
+                    ),
                     isAnswerSide: isBack,
                     cardOrdinal: session.currentCardOrdinal,
                     replayRequestID: session.replayRequestID,
+                    replayCardID: session.replayCardID,
+                    replayIsAnswerSide: session.replayIsAnswerSide,
                     stopAudioRequestID: session.stopAudioRequestID,
+                    scrollRequestID: scrollRequestID,
+                    scrollDirection: scrollDirection,
+                    continuousScrollDelta: continuousScrollDelta,
+                    userActionRequestID: userActionRequestID,
+                    userActionIndex: userActionIndex,
+                    userActionCardID: userActionCardID,
+                    userActionIsAnswerSide: userActionIsAnswerSide,
+                    replayMode: isBack
+                        ? CardWebViewReplayMode.answerPolicy(answerAudioPolicy)
+                        : .question,
                     openLinksExternally: openLinksExternally,
                     lookupPopupEnabled: tapLookup && !session.requiresTypedAnswerInput,
                     dictionaryScanLength: dictionaryScanLength,
                     lookupHighlight: lookupHighlight,
                     contentAlignment: CardWebViewContentAlignment(rawValue: cardContentAlignment) ?? .center,
+                    tapControlsEnabled: tapControlsAvailable,
                     onAudioStateChange: { playing in session.updateAudioPlaying(playing) },
                     onCardBackgroundColorChange: { color, isDark in
                         session.updateCardChrome(color: color, isDark: isDark)
@@ -202,16 +307,186 @@ struct ReviewCardArea: View {
                     onLookupRequested: tapLookup && !session.requiresTypedAnswerInput ? { text, _, _ in
                         if let text, !text.isEmpty { lookupQuery = text }
                     } : nil,
-                    onShowAnswerRequested: { session.revealAnswer() }
+                    onShowAnswerRequested: { session.revealAnswer() },
+                    onReviewTapRequested: handleReviewTap,
+                    onEditableFocusChange: { isWebEditableFocused = $0 }
                 )
             }
         }
     }
 
+    @ViewBuilder
+    private func nativeCardSurface(content: NativeCardContent, isBack: Bool) -> some View {
+        if tapControlsAvailable {
+            GeometryReader { proxy in
+                NativeCardView(
+                    content: content,
+                    isAnswerSide: isBack,
+                    mediaFolder: mediaFolder,
+                    zoomScale: zoomScale,
+                    scrollRequestID: scrollRequestID,
+                    scrollDirection: scrollDirection,
+                    continuousScrollDelta: continuousScrollDelta
+                )
+                .contentShape(Rectangle())
+                .simultaneousGesture(
+                    SpatialTapGesture().onEnded { value in
+                        handleReviewTap(value.location.x / max(proxy.size.width, 1))
+                    }
+                )
+            }
+        } else {
+            NativeCardView(
+                content: content,
+                isAnswerSide: isBack,
+                mediaFolder: mediaFolder,
+                zoomScale: zoomScale,
+                scrollRequestID: scrollRequestID,
+                scrollDirection: scrollDirection,
+                continuousScrollDelta: continuousScrollDelta
+            )
+        }
+    }
 
-    private func playNativeAudio() {
+    private func handleReviewTap(_ horizontalFraction: CGFloat) {
+        let action = ReviewTapPolicy.action(
+            isEnabled: tapControlsAvailable,
+            isShowingAnswer: session.showAnswer,
+            isAdvancing: session.isAdvancing || isAnswerTransitioning,
+            horizontalFraction: horizontalFraction
+        )
+        performReviewAction(action)
+    }
+
+    private func handleGamepadInput(_ event: ReviewGamepadInputEvent) {
+        let action = ReviewInputRouter.action(
+            for: event.input,
+            settings: reviewInputSettings,
+            context: reviewInputContext
+        )
+        if event.source == .axisEdge, case .scroll = action { return }
+        performSemanticAction(action)
+    }
+
+    private func handleGamepadAxisFrames(_ frames: [ReviewGamepadAxisFrame]) {
+        var combinedDelta: CGFloat = 0
+        for frame in frames {
+            var frameDelta: CGFloat = 0
+            for sample in frame.samples {
+                guard case .scroll(let direction) = ReviewInputRouter.action(
+                    for: sample.input,
+                    settings: reviewInputSettings,
+                    context: reviewInputContext
+                ) else { continue }
+                frameDelta += ReviewScrollPolicy.continuousDelta(
+                    magnitude: sample.magnitude,
+                    elapsed: frame.elapsed,
+                    direction: direction
+                )
+            }
+            combinedDelta += ReviewScrollPolicy.clampedCombinedDelta(
+                frameDelta,
+                elapsed: frame.elapsed
+            )
+        }
+        guard combinedDelta != 0 else { return }
+        continuousScrollDelta = combinedDelta
+        scrollRequestID &+= 1
+    }
+
+    private var reviewInputContext: ReviewInputContext {
+        ReviewInputContext(
+            preferenceEnabled: gamepadControlsEnabled,
+            hasConnectedController: gamepadMonitor.hasConnectedController,
+            shortcutsEnabled: shortcutsEnabled,
+            requiresTypedAnswerInput: session.requiresTypedAnswerInput,
+            side: session.showAnswer ? .answer : .question,
+            isAdvancing: session.isAdvancing,
+            isAnswerTransitioning: isAnswerTransitioning,
+            hasBlockingPresentation: showRenderModeSheet || session.answerError != nil,
+            hasEditableWebFocus: isWebEditableFocused,
+            canUndo: session.canUndo,
+            syncActionInstalled: startSync.isInstalled,
+            userActionsAvailable: !isNativeMode
+        )
+    }
+
+    private func performReviewAction(_ action: ReviewTapAction?) {
+        switch action {
+        case .revealAnswer:
+            isAnswerTransitioning = true
+            session.revealAnswer()
+            Task {
+                try? await Task.sleep(for: .milliseconds(250))
+                isAnswerTransitioning = false
+            }
+        case .rate(let rating):
+            session.answer(rating: rating)
+        case nil:
+            break
+        }
+    }
+
+    private func performSemanticAction(_ action: ReviewSemanticAction?) {
+        switch action {
+        case .revealAnswer:
+            isAnswerTransitioning = true
+            session.revealAnswer()
+            Task {
+                try? await Task.sleep(for: .milliseconds(250))
+                isAnswerTransitioning = false
+            }
+        case .rate(let rating):
+            session.answer(rating: rating)
+        case .undo:
+            session.undo()
+        case .sync:
+            startSync()
+        case .syncUnavailable:
+            showSyncUnavailable = true
+        case .replayOrStopAudio:
+            if session.isAudioPlaying {
+                session.bumpStopAudioRequest()
+            } else {
+                session.bumpReplayRequest()
+            }
+        case .scroll(let direction):
+            scrollDirection = direction
+            continuousScrollDelta = nil
+            scrollRequestID &+= 1
+        case .userAction(let index):
+            userActionIndex = index
+            userActionCardID = session.currentCardId
+            userActionIsAnswerSide = session.showAnswer
+            userActionRequestID &+= 1
+        case nil:
+            break
+        }
+    }
+
+    private func updateGamepadMonitoring() {
+        if gamepadControlsEnabled {
+            gamepadMonitor.start()
+        } else {
+            gamepadMonitor.stop()
+        }
+    }
+
+    private func playNativeAudio(automatic: Bool) {
         guard case .native(let front, let back) = session.resolvedMode else { return }
-        let files = session.showAnswer ? back.audioFiles : front.audioFiles
+        guard !automatic || audioAutoplayPolicy == .enabled else { return }
+        let files: [String]
+        if session.showAnswer {
+            switch answerAudioPolicy {
+            case .questionAndAnswer:
+                files = back.audioFiles
+            case .answerOnly:
+                let questionFiles = Set(front.audioFiles)
+                files = back.audioFiles.filter { !questionFiles.contains($0) }
+            }
+        } else {
+            files = front.audioFiles
+        }
         guard !files.isEmpty else { return }
         nativeAudioPlayer.play(files: files, mediaFolder: mediaFolder)
     }

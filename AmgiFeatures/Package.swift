@@ -317,6 +317,7 @@ let package = Package(
             dependencies: [
                 "SyncFeature",
                 "AppCore",
+                "AppShared",
                 .product(name: "AnkiKit", package: "amgi"),
                 .product(name: "AnkiClients", package: "amgi"),
                 .product(name: "Sharing", package: "swift-sharing"),

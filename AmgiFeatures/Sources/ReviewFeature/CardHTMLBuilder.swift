@@ -72,25 +72,28 @@ extension CardWebView {
         isAnswerSide: Bool,
         lookupPopupEnabled: Bool,
         dictionaryScanLength: Int,
+        tapControlsEnabled: Bool,
         bodyClass: String,
         autoplayEnabled: Bool,
         replayMode: String,
         alignTop: Bool,
         bodyPaddingBottom: Int,
-        cardPaddingBottom: Int
+        cardPaddingBottom: Int,
+        contentGeneration: Int
     ) -> String {
         let htmlLit = jsStringLiteral(processedHTML)
         let cssLit = jsStringLiteral(cardCSS)
         let autoplay = autoplayEnabled ? "true" : "false"
         let lookupEnabled = lookupPopupEnabled ? "true" : "false"
+        let tapControls = tapControlsEnabled ? "true" : "false"
         let alignTopStr = alignTop ? "true" : "false"
         let applyCSS = "amgiSetCardCSS(\(cssLit));"
 
         if isAnswerSide {
-            return applyCSS + "_showAnswer(\(htmlLit),\(jsStringLiteral(bodyClass)),\(autoplay),\(jsStringLiteral(replayMode)),\(alignTopStr),\(bodyPaddingBottom),\(cardPaddingBottom),\(lookupEnabled),\(dictionaryScanLength)" + ");"
+            return applyCSS + "_showAnswer(\(htmlLit),\(jsStringLiteral(bodyClass)),\(autoplay),\(jsStringLiteral(replayMode)),\(alignTopStr),\(bodyPaddingBottom),\(cardPaddingBottom),\(lookupEnabled),\(dictionaryScanLength),\(tapControls),\(contentGeneration)" + ");"
         } else {
             let prefetchLit = jsStringLiteral(prefetchHTML ?? "")
-            return applyCSS + "_showQuestion(\(htmlLit),\(prefetchLit),\(jsStringLiteral(bodyClass)),\(autoplay),\(jsStringLiteral(replayMode)),\(alignTopStr),\(bodyPaddingBottom),\(cardPaddingBottom),\(lookupEnabled),\(dictionaryScanLength)" + ");"
+            return applyCSS + "_showQuestion(\(htmlLit),\(prefetchLit),\(jsStringLiteral(bodyClass)),\(autoplay),\(jsStringLiteral(replayMode)),\(alignTopStr),\(bodyPaddingBottom),\(cardPaddingBottom),\(lookupEnabled),\(dictionaryScanLength),\(tapControls),\(contentGeneration)" + ");"
         }
     }
 
@@ -160,12 +163,13 @@ extension CardWebView {
             let voices = options["voices"] ?? ""
             let speed = options["speed"] ?? ""
 
+            let attributes = "data-tts-text=\"\(htmlAttributeEscaped(spokenText))\" data-tts-lang=\"\(htmlAttributeEscaped(lang))\" data-tts-voices=\"\(htmlAttributeEscaped(voices))\" data-tts-speed=\"\(htmlAttributeEscaped(speed))\""
             let replacement: String
             if showReplayButtons {
                 let iconHTML = audioButtonIconHTML(systemName: "play.circle", alt: "Speak", isDarkMode: isDarkMode)
-                replacement = "<a class=\"replay-button replay-btn tts-btn\" href=\"#\" draggable=\"false\" data-tts-text=\"\(htmlAttributeEscaped(spokenText))\" data-tts-lang=\"\(htmlAttributeEscaped(lang))\" data-tts-voices=\"\(htmlAttributeEscaped(voices))\" data-tts-speed=\"\(htmlAttributeEscaped(speed))\" onclick=\"return amgiSpeakTts(this)\">\(iconHTML)</a>"
+                replacement = "<a class=\"anki-tts-audio replay-button replay-btn tts-btn\" \(attributes) href=\"#\" draggable=\"false\" onclick=\"return amgiSpeakTts(this)\">\(iconHTML)</a>"
             } else {
-                replacement = ""
+                replacement = "<span class=\"anki-tts-audio\" \(attributes) hidden></span>"
             }
 
             result.replaceSubrange(matchRange, with: replacement)

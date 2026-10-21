@@ -187,8 +187,13 @@ import AnkiServices
         #expect(session.replayRequestID == 0)
         session.bumpReplayRequest()
         #expect(session.replayRequestID == 1)
+        #expect(session.replayCardID == session.currentCardId)
+        #expect(session.replayIsAnswerSide == false)
+        session.revealAnswer()
+        #expect(session.replayIsAnswerSide == false)
         session.bumpReplayRequest()
         #expect(session.replayRequestID == 2)
+        #expect(session.replayIsAnswerSide == true)
     }
 
     @Test func bumpStopAudioRequestIncrementsCounter() {

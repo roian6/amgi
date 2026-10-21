@@ -33,6 +33,11 @@ __AMGI_BASE_TAG__
         width: 100%; box-sizing: border-box;
         padding-bottom: var(--amgi-card-padding-bottom, 0px);
     }
+    html.amgi-regular-width body { margin-inline: 0; padding-inline: 20px; }
+    #qa {
+        max-width: var(--amgi-content-max-width, none);
+        margin-inline: auto;
+    }
     hr { border: none; border-top: 1px solid __AMGI_HR_COLOR__; margin: 16px 0; }
     ruby {
         ruby-position: over;
@@ -137,6 +142,9 @@ var amgiPreloadTemplate = document.createElement('template');
 var amgiPreloadDoc = document.implementation.createHTMLDocument('');
 var amgiFontURLPattern = /url\s*\(\s*(["']?)(\S.*?)\1\s*\)/g;
 var amgiCachedFonts = new Set();
+window.__amgiAudioQueueToken = 0;
+window.__amgiNextTtsRequestID = 0;
+window.__amgiPendingTts = null;
 
 // ── Card state ──────────────────────────────────────────────────────
 window.__amgiCardState = {};
@@ -147,6 +155,10 @@ function amgiIsAnswerSide() { return !!(amgiCardState().isAnswerSide); }
 function amgiLookupPopupEnabled() { return !!(amgiCardState().lookupPopupEnabled); }
 function amgiReplayModeValue() { return amgiCardState().replayMode || 'question'; }
 function amgiPrefetchHTMLValue() { return amgiCardState().prefetchHTML || ''; }
+function amgiContentGenerationValue() {
+    var value = amgiCardState().contentGeneration;
+    return Number.isFinite(value) ? value : Number(window.__amgiContentGeneration || 0);
+}
 
 function amgiApplyCardState(state) {
     window.__amgiCardState = Object.assign({}, window.__amgiCardState || {}, state || {});
@@ -180,6 +192,73 @@ document.addEventListener('click', function(event) {
     var payload = amgiCardLookupPayloadAt(event.clientX, event.clientY, state.dictionaryScanLength);
     if (!payload) return;
     try { window.webkit.messageHandlers.amgiLookupText.postMessage(payload); } catch(e) {}
+}, false);
+
+var amgiReviewTapCandidate = null;
+
+function amgiReviewTapPayloadAt(x, y) {
+    var state = amgiCardState();
+    if (!state.tapControlsEnabled) return null;
+    var selection = window.getSelection();
+    if (selection && selection.toString().length > 0) return null;
+    var target = document.elementFromPoint(x, y);
+    if (!target || !target.closest) return null;
+    if (target.closest('a, button, input, textarea, select, option, label, [contenteditable]:not([contenteditable="false"]), audio, video, details, summary, iframe, object, embed, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="switch"], [role="slider"], [role="textbox"], [role="combobox"], .replay-button, .replay-btn, .sound-btn, #image-occlusion-canvas')) {
+        return null;
+    }
+    if (amgiCardLookupPayloadAt(x, y, state.dictionaryScanLength)) return null;
+    var width = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+    return width > 0 ? { x: x, y: y, width: width } : null;
+}
+
+function amgiElementAcceptsTextInput(element) {
+    if (!element || !element.closest) return false;
+    return !!element.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"]');
+}
+
+function amgiReportEditableFocus() {
+    var focused = amgiElementAcceptsTextInput(document.activeElement);
+    try { window.webkit.messageHandlers.amgiEditableFocus.postMessage(focused); } catch(e) {}
+}
+
+document.addEventListener('focusin', amgiReportEditableFocus, false);
+document.addEventListener('focusout', function() {
+    setTimeout(amgiReportEditableFocus, 0);
+}, false);
+
+document.addEventListener('pointerdown', function(event) {
+    if (!event.isPrimary || event.button !== 0 || !amgiReviewTapPayloadAt(event.clientX, event.clientY)) {
+        amgiReviewTapCandidate = null;
+        return;
+    }
+    amgiReviewTapCandidate = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        startedAt: Date.now()
+    };
+}, false);
+
+document.addEventListener('pointermove', function(event) {
+    var candidate = amgiReviewTapCandidate;
+    if (!candidate || candidate.pointerId !== event.pointerId) return;
+    var dx = event.clientX - candidate.x;
+    var dy = event.clientY - candidate.y;
+    if (dx * dx + dy * dy > 144) amgiReviewTapCandidate = null;
+}, false);
+
+document.addEventListener('pointercancel', function() {
+    amgiReviewTapCandidate = null;
+}, false);
+
+document.addEventListener('pointerup', function(event) {
+    var candidate = amgiReviewTapCandidate;
+    amgiReviewTapCandidate = null;
+    if (!candidate || candidate.pointerId !== event.pointerId) return;
+    if (Date.now() - candidate.startedAt > 500) return;
+    var payload = amgiReviewTapPayloadAt(event.clientX, event.clientY);
+    if (!payload) return;
+    try { window.webkit.messageHandlers.amgiReviewTap.postMessage(payload); } catch(e) {}
 }, false);
 
 function amgiSetCardCSS(cssText) {
@@ -513,7 +592,15 @@ function notifyAudioState(isPlaying) {
     try { window.webkit.messageHandlers.amgiAudioState.postMessage(window.__amgiAudioPlaying); } catch(e) {}
 }
 function amgiStopTts() {
-    try { window.webkit.messageHandlers.amgiStopTts.postMessage(null); } catch(e) {}
+    var pending = window.__amgiPendingTts;
+    window.__amgiPendingTts = null;
+    if (!pending) return;
+    try {
+        window.webkit.messageHandlers.amgiStopTts.postMessage({
+            contentGeneration: pending.contentGeneration,
+            requestID: pending.requestID
+        });
+    } catch(e) {}
 }
 window.amgiStopTts = amgiStopTts;
 // Shared hidden queue player. WKWebView's per-element <audio>.play() loses
@@ -529,12 +616,17 @@ function amgiQueuePlayer() {
     document.body.appendChild(player);
     return player;
 }
-// Exclude the internal queue player from "template-managed media" detection
-// so its presence on the page doesn't make us skip autoplay.
-function amgiHasTemplateManagedMedia() {
-    return document.querySelector('audio:not(.anki-sound-audio):not(#amgi-audio-queue-player), video') !== null;
+// Passive template controls do not compete with Anki autoplay. Explicit replay
+// bypasses this check; neither path takes ownership of template media.
+function amgiHasAutomaticMediaCollision() {
+    return Array.from(document.querySelectorAll('audio:not(.anki-sound-audio):not(#amgi-audio-queue-player), video')).some(function(media) {
+        return media.autoplay || (!media.paused && !media.ended);
+    });
 }
-function stopAllSystemAudio() {
+function stopAllSystemAudio(expectedContentGeneration) {
+    if (expectedContentGeneration !== undefined && expectedContentGeneration !== amgiContentGenerationValue()) return;
+    window.__amgiAudioQueueToken += 1;
+    window.__amgiInlineAudioElement = null;
     amgiStopTts();
     document.querySelectorAll('.anki-sound-audio').forEach(function(a) {
         if (!a.paused) a.pause();
@@ -554,22 +646,24 @@ function stopAllSystemAudio() {
     notifyAudioState(false);
 }
 window.amgiStopAllAudio = stopAllSystemAudio;
-function collectAudioQueue(mode) {
-    var all = Array.from(document.querySelectorAll('.anki-sound-audio'));
-    if (mode === 'question' || mode === 'answerWithQuestion') return all;
-    // answerOnly: exclude audio already played on the question side. Handles
-    // back-template audio fields placed before <hr id=answer> (e.g. {{发音}}
-    // between {{FrontSide}} and the marker) which the pure DOM-position
-    // filter would otherwise miss.
-    var questionSrcs = window.__amgiQuestionAudioSrcs;
-    if (questionSrcs && questionSrcs.size > 0) {
-        var newAudio = all.filter(function(a) {
-            var src = a.getAttribute('src') || '';
-            return src && !questionSrcs.has(src);
-        });
-        return newAudio.length > 0 ? newAudio : all;
+function amgiIsTtsAudioItem(item) {
+    return !!(item && typeof item.className === 'string' && item.className.split(/\s+/).includes('anki-tts-audio'));
+}
+function amgiAudioItemKey(item) {
+    if (amgiIsTtsAudioItem(item)) {
+        return ['tts', item.dataset.ttsText || '', item.dataset.ttsLang || '', item.dataset.ttsVoices || '', item.dataset.ttsSpeed || ''].join('|');
     }
-    // Fallback when question srcs aren't recorded yet.
+    return 'sound|' + (item.getAttribute('src') || '');
+}
+function collectAudioQueue(mode) {
+    var all = Array.from(document.querySelectorAll('.anki-sound-audio, .anki-tts-audio'));
+    if (mode === 'question' || mode === 'answerWithQuestion') return all;
+    var questionKeys = window.__amgiQuestionAudioKeys;
+    if (questionKeys && questionKeys.size > 0) {
+        return all.filter(function(item) {
+            return !questionKeys.has(amgiAudioItemKey(item));
+        });
+    }
     var marker = document.getElementById('answer');
     if (!marker) return all;
     var after = all.filter(function(a) {
@@ -592,12 +686,24 @@ function splitAudioQueue() {
         answer: answer.length ? answer : all
     };
 }
+async function amgiPlayPreparedSound(audio, contentGeneration, isCurrent, src) {
+    var prepared = await window.webkit.messageHandlers.amgiPrepareAudio.postMessage({
+        contentGeneration: contentGeneration
+    });
+    if (!isCurrent()) return;
+    if (prepared !== true) throw new Error('Review audio preparation failed');
+    if (src !== undefined) audio.src = src;
+    audio.currentTime = 0;
+    await audio.play();
+}
 function replaySequential(queue) {
     stopAllSystemAudio();
     if (!queue || !queue.length) return;
     var idx = 0;
     var currentBtn = null;
     var player = amgiQueuePlayer();
+    var queueToken = window.__amgiAudioQueueToken;
+    var contentGeneration = amgiContentGenerationValue();
     notifyAudioState(true);
     function clearCurrentButton() {
         if (!currentBtn) return;
@@ -605,42 +711,95 @@ function replaySequential(queue) {
         currentBtn = null;
     }
     function playNext() {
+        if (queueToken !== window.__amgiAudioQueueToken || contentGeneration !== amgiContentGenerationValue()) return;
         clearCurrentButton();
         if (idx >= queue.length) { notifyAudioState(false); return; }
-        var audio = queue[idx];
+        var audio = queue[idx++];
+        if (amgiIsTtsAudioItem(audio)) {
+            if (!(audio.dataset.ttsText || '').trim()) { playNext(); return; }
+            currentBtn = audio;
+            setAudioButtonState(currentBtn, 'pause');
+            var requestID = ++window.__amgiNextTtsRequestID;
+            window.__amgiPendingTts = {
+                contentGeneration: contentGeneration,
+                requestID: requestID,
+                queueToken: queueToken,
+                continueQueue: playNext
+            };
+            try {
+                window.webkit.messageHandlers.amgiSpeakTts.postMessage({
+                    text: audio.dataset.ttsText || '',
+                    lang: audio.dataset.ttsLang || '',
+                    voices: audio.dataset.ttsVoices || '',
+                    speed: audio.dataset.ttsSpeed || '',
+                    contentGeneration: contentGeneration,
+                    requestID: requestID
+                });
+            } catch(e) {
+                window.__amgiPendingTts = null;
+                playNext();
+            }
+            return;
+        }
         var src = audio.currentSrc || audio.src;
-        if (!src) { idx++; playNext(); return; }
+        if (!src) { playNext(); return; }
         currentBtn = audio.nextElementSibling;
         setAudioButtonState(currentBtn, 'pause');
-        player.src = src;
-        player.currentTime = 0;
-        player.play().catch(function() { idx++; playNext(); });
+        var itemIndex = idx;
+        function isCurrent() {
+            return queueToken === window.__amgiAudioQueueToken
+                && contentGeneration === amgiContentGenerationValue() && itemIndex === idx;
+        }
+        function advance() { if (isCurrent()) playNext(); }
+        player.onended = advance;
+        player.onerror = advance;
+        amgiPlayPreparedSound(player, contentGeneration, isCurrent, src).catch(advance);
     }
-    player.onended = function() { idx++; playNext(); };
-    player.onerror = function() { idx++; playNext(); };
     playNext();
 }
-function amgiReplayAll(mode) {
-    if (amgiHasTemplateManagedMedia()) return;
+function amgiTtsDidFinish(contentGeneration, requestID) {
+    var pending = window.__amgiPendingTts;
+    if (!pending || pending.contentGeneration !== contentGeneration || pending.requestID !== requestID) return;
+    if (pending.queueToken !== window.__amgiAudioQueueToken || contentGeneration !== amgiContentGenerationValue()) return;
+    window.__amgiPendingTts = null;
+    pending.continueQueue();
+}
+window.amgiTtsDidFinish = amgiTtsDidFinish;
+function amgiReplayAll(mode, expectedContentGeneration) {
+    if (expectedContentGeneration !== undefined && expectedContentGeneration !== amgiContentGenerationValue()) return;
     replaySequential(collectAudioQueue(mode));
 }
 window.amgiReplayAll = amgiReplayAll;
+function amgiAutoplay(mode, contentGeneration) {
+    if (amgiAutoplayEnabled() && !amgiHasAutomaticMediaCollision()) {
+        amgiReplayAll(mode, contentGeneration);
+    }
+}
 function amgiPlayAudioElement(audio) {
     if (!audio) return false;
     var btn = audio.nextElementSibling;
     // Toggle: if this element is currently playing, pause it and flip icon.
     // Diverges from fork's replay-only behavior so the pause icon is functional.
-    if (!audio.paused) {
-        audio.pause();
-        setAudioButtonState(btn, 'play');
-        notifyAudioState(false);
+    if (!audio.paused || window.__amgiInlineAudioElement === audio) {
+        stopAllSystemAudio();
         return false;
     }
     stopAllSystemAudio(); notifyAudioState(true);
-    audio.currentTime = 0;
-    audio.play().catch(function() { setAudioButtonState(btn, 'play'); notifyAudioState(false); });
+    var queueToken = window.__amgiAudioQueueToken;
+    var contentGeneration = amgiContentGenerationValue();
+    window.__amgiInlineAudioElement = audio;
+    function isCurrent() {
+        return queueToken === window.__amgiAudioQueueToken && contentGeneration === amgiContentGenerationValue();
+    }
+    function finish() {
+        if (!isCurrent()) return;
+        window.__amgiInlineAudioElement = null;
+        setAudioButtonState(btn, 'play');
+        notifyAudioState(false);
+    }
+    amgiPlayPreparedSound(audio, contentGeneration, isCurrent).catch(finish);
     setAudioButtonState(btn, 'pause');
-    audio.onended = function() { setAudioButtonState(btn, 'play'); notifyAudioState(false); };
+    audio.onended = finish;
     return false;
 }
 function playSound(btn) { return amgiPlayAudioElement(btn ? btn.previousElementSibling : null); }
@@ -688,15 +847,7 @@ window.open = function(url) { postOpenLink(url); return null; };
 // ===== TTS =====
 function amgiSpeakTts(btn) {
     if (!btn) return false;
-    stopAllSystemAudio();
-    try {
-        window.webkit.messageHandlers.amgiSpeakTts.postMessage({
-            text: btn.dataset.ttsText || '',
-            lang: btn.dataset.ttsLang || '',
-            voices: btn.dataset.ttsVoices || '',
-            speed: btn.dataset.ttsSpeed || ''
-        });
-    } catch(e) {}
+    replaySequential([btn]);
     return false;
 }
 window.amgiSpeakTts = amgiSpeakTts; globalThis.amgiSpeakTts = amgiSpeakTts;
@@ -1093,20 +1244,33 @@ async function amgiUpdateQA(html, state, onupdate, onshown) {
 // ── Serial queue (mirrors upstream _queueAction) ─────────────────────
 function amgiQueueAction(action) {
     window.__amgiUpdateQueue = (window.__amgiUpdateQueue || Promise.resolve()).then(action);
+    return window.__amgiUpdateQueue;
+}
+
+function amgiNotifyCardReady(contentGeneration) {
+    try { window.webkit.messageHandlers.amgiCardReady.postMessage(contentGeneration); } catch(e) {}
+}
+
+function amgiCompleteContentUpdate(contentGeneration, replayMode) {
+    window.__amgiContentGeneration = contentGeneration;
+    amgiAutoplay(replayMode, contentGeneration);
+    amgiNotifyCardReady(contentGeneration);
 }
 
 // ── Public API called from Swift via evaluateJavaScript ───────────────
-function _showQuestion(html, prefetchHTML, bodyclass, autoplay, replayMode, alignTop, bodyPaddingBottom, cardPaddingBottom, lookupPopupEnabled, dictionaryScanLength) {
-    amgiQueueAction(function() {
+function _showQuestion(html, prefetchHTML, bodyclass, autoplay, replayMode, alignTop, bodyPaddingBottom, cardPaddingBottom, lookupPopupEnabled, dictionaryScanLength, tapControlsEnabled, contentGeneration) {
+    var updatePromise = amgiQueueAction(function() {
         return amgiUpdateQA(
             html,
             {
                 isAnswerSide: false,
                 lookupPopupEnabled: !!lookupPopupEnabled,
                 dictionaryScanLength: dictionaryScanLength ?? 16,
+                tapControlsEnabled: !!tapControlsEnabled,
                 bodyClass: bodyclass,
                 autoplayEnabled: !!autoplay,
                 replayMode: replayMode || 'question',
+                contentGeneration: contentGeneration,
                 alignTop: !!alignTop,
                 bodyPaddingBottom: bodyPaddingBottom || 16,
                 cardPaddingBottom: cardPaddingBottom || 0,
@@ -1117,19 +1281,13 @@ function _showQuestion(html, prefetchHTML, bodyclass, autoplay, replayMode, alig
                 window.scrollTo(0, 0);
                 // Reset for the new card so the answer side can use the
                 // question-srcs exclusion path on the next flip.
-                window.__amgiQuestionAudioSrcs = null;
+                window.__amgiQuestionAudioKeys = null;
             },
             function() {
                 var typeans = document.getElementById('typeans');
                 if (typeans) typeans.focus();
-                var hasTemplateManagedMedia = amgiHasTemplateManagedMedia();
-                if (amgiAutoplayEnabled() && !hasTemplateManagedMedia) amgiReplayAll(amgiReplayModeValue());
-                // Record question-side audio srcs so `answerOnly` mode can
-                // exclude them without relying on <hr id=answer> position.
-                window.__amgiQuestionAudioSrcs = new Set(
-                    Array.from(document.querySelectorAll('.anki-sound-audio')).map(function(a) {
-                        return a.getAttribute('src') || '';
-                    }).filter(Boolean)
+                window.__amgiQuestionAudioKeys = new Set(
+                    Array.from(document.querySelectorAll('.anki-sound-audio, .anki-tts-audio')).map(amgiAudioItemKey)
                 );
                 var ph = amgiPrefetchHTMLValue();
                 if (amgiContainsMathJaxMarkup(html || '') || amgiContainsMathJaxMarkup(ph || '')) {
@@ -1139,19 +1297,24 @@ function _showQuestion(html, prefetchHTML, bodyclass, autoplay, replayMode, alig
             }
         );
     });
+    updatePromise.then(function() {
+        amgiCompleteContentUpdate(contentGeneration, replayMode || 'question');
+    });
 }
 
-function _showAnswer(html, bodyclass, autoplay, replayMode, alignTop, bodyPaddingBottom, cardPaddingBottom, lookupPopupEnabled, dictionaryScanLength) {
-    amgiQueueAction(function() {
+function _showAnswer(html, bodyclass, autoplay, replayMode, alignTop, bodyPaddingBottom, cardPaddingBottom, lookupPopupEnabled, dictionaryScanLength, tapControlsEnabled, contentGeneration) {
+    var updatePromise = amgiQueueAction(function() {
         return amgiUpdateQA(
             html,
             {
                 isAnswerSide: true,
                 lookupPopupEnabled: !!lookupPopupEnabled,
                 dictionaryScanLength: dictionaryScanLength ?? 16,
+                tapControlsEnabled: !!tapControlsEnabled,
                 bodyClass: bodyclass,
                 autoplayEnabled: !!autoplay,
                 replayMode: replayMode || 'answerOnly',
+                contentGeneration: contentGeneration,
                 alignTop: !!alignTop,
                 bodyPaddingBottom: bodyPaddingBottom || 16,
                 cardPaddingBottom: cardPaddingBottom || 0,
@@ -1164,12 +1327,11 @@ function _showAnswer(html, bodyclass, autoplay, replayMode, alignTop, bodyPaddin
                     var marker = document.getElementById('answer');
                     if (marker) marker.scrollIntoView();
                 });
-            },
-            function() {
-                var hasTemplateManagedMedia = amgiHasTemplateManagedMedia();
-                if (amgiAutoplayEnabled() && !hasTemplateManagedMedia) amgiReplayAll(amgiReplayModeValue());
             }
         );
+    });
+    updatePromise.then(function() {
+        amgiCompleteContentUpdate(contentGeneration, replayMode || 'answerOnly');
     });
 }
 

@@ -6,6 +6,7 @@
 //
 
 import AppCore
+import AppShared
 import AnkiKit
 import DecksFeature
 import ReaderFeature

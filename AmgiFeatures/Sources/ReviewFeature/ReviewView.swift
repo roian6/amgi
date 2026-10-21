@@ -51,6 +51,30 @@ package struct ReviewView: View {
     @Shared(.appStorage(ReviewPreferences.Keys.playAudioInSilentMode))
     private var playAudioInSilentMode: Bool = false
 
+    @Shared(.appStorage(ReviewPreferences.Keys.audioAutoplay))
+    private var audioAutoplay: String = ReviewAutoplayPolicy.defaultValue.rawValue
+
+    @Shared(.appStorage(ReviewPreferences.Keys.answerAudio))
+    private var answerAudio: String = ReviewAnswerAudioPolicy.defaultValue.rawValue
+
+    @Shared(.appStorage(ReviewPreferences.Keys.zoomScale))
+    private var zoomScale: Double = ReviewZoomPolicy.defaultScale
+
+    @Shared(.appStorage(ReviewPreferences.Keys.answerZoom))
+    private var answerZoom: String = ReviewAnswerZoomPolicy.defaultValue.rawValue
+
+    @Shared(.appStorage(ReviewPreferences.Keys.tapControls))
+    private var tapControls: Bool = false
+
+    @Shared(.appStorage(ReviewPreferences.Keys.gamepadControls))
+    private var gamepadControls: Bool = false
+
+    @Shared(.appStorage(ReviewPreferences.Keys.reviewInputSettings))
+    private var reviewInputSettingsRaw: String = ""
+
+    @Shared(.appStorage(ReviewPreferences.Keys.showAnswerButtons))
+    private var showAnswerButtons: Bool = true
+
     @State private var session: ReviewSession
     @State private var destination: ReviewDestination?
 
@@ -69,6 +93,14 @@ package struct ReviewView: View {
             cardContentAlignment: cardContentAlignment,
             tapLookup: tapLookup,
             showNextReviewTime: showNextReviewTime,
+            tapControlsEnabled: tapControls,
+            gamepadControlsEnabled: gamepadControls,
+            reviewInputSettings: ReviewInputSettingsCodec.decode(reviewInputSettingsRaw),
+            showAnswerButtons: showAnswerButtons,
+            audioAutoplayPolicy: ReviewAutoplayPolicy.resolved(audioAutoplay),
+            answerAudioPolicy: ReviewAnswerAudioPolicy.resolved(answerAudio),
+            zoomScale: Binding($zoomScale),
+            answerZoomPolicy: ReviewAnswerZoomPolicy.resolved(answerZoom),
             destination: $destination,
             onDismiss: onDismiss
         )

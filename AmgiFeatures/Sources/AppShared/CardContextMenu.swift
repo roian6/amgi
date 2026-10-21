@@ -19,15 +19,18 @@ public import AnkiKit
 public struct CardFlagPicker: View {
     let model: CardContextMenuModel
     let cardId: CardID
+    var onSelection: () -> Void
     var onAction: (_ shouldAdvance: Bool) -> Void
 
     public init(
         model: CardContextMenuModel,
         cardId: CardID,
+        onSelection: @escaping () -> Void = {},
         onAction: @escaping (_ shouldAdvance: Bool) -> Void = { _ in }
     ) {
         self.model = model
         self.cardId = cardId
+        self.onSelection = onSelection
         self.onAction = onAction
     }
 
@@ -36,6 +39,7 @@ public struct CardFlagPicker: View {
             Picker("Flag", selection: Binding(
                 get: { model.currentFlag & 0b111 },
                 set: { value in
+                    onSelection()
                     Task {
                         if let advance = await model.flag(cardId, value) { onAction(advance) }
                     }
@@ -68,6 +72,7 @@ public struct CardActionSections: View {
     let cardId: CardID
     var noteId: NoteID?
     @Binding var confirmDeleteNote: Bool
+    var onSelection: () -> Void
     var onAction: (_ shouldAdvance: Bool) -> Void
 
     public init(
@@ -75,49 +80,63 @@ public struct CardActionSections: View {
         cardId: CardID,
         noteId: NoteID? = nil,
         confirmDeleteNote: Binding<Bool>,
+        onSelection: @escaping () -> Void = {},
         onAction: @escaping (_ shouldAdvance: Bool) -> Void = { _ in }
     ) {
         self.model = model
         self.cardId = cardId
         self.noteId = noteId
         self._confirmDeleteNote = confirmDeleteNote
+        self.onSelection = onSelection
         self.onAction = onAction
     }
 
     public var body: some View {
         Section {
-            Button { act { await model.suspend(cardId) } } label: {
+            Button { selectAndAct { await model.suspend(cardId) } } label: {
                 Label("Suspend Card", systemImage: "pause.circle")
             }
-            Button { act { await model.bury(cardId) } } label: {
+            Button { selectAndAct { await model.bury(cardId) } } label: {
                 Label("Bury Card Until Tomorrow", systemImage: "moon.zzz")
             }
-            Button { act { await model.resetToNew(cardId) } } label: {
+            Button { selectAndAct { await model.resetToNew(cardId) } } label: {
                 Label("Forget Card", systemImage: "arrow.counterclockwise")
             }
-            Button { model.showSetDueDate = true } label: {
+            Button {
+                onSelection()
+                Task { @MainActor in
+                    await Task.yield()
+                    model.showSetDueDate = true
+                }
+            } label: {
                 Label("Set Due Date", systemImage: "calendar.badge.clock")
             }
         }
 
         if let noteId {
             Section {
-                Button { act { await model.toggleMarked(noteId) } } label: {
+                Button { selectAndAct { await model.toggleMarked(noteId) } } label: {
                     Label(
                         model.isMarkedNote ? "Unmark Note" : "Mark Note",
                         systemImage: model.isMarkedNote ? "star.slash" : "star"
                     )
                 }
-                Button { act { await model.suspendNote(noteId) } } label: {
+                Button { selectAndAct { await model.suspendNote(noteId) } } label: {
                     Label("Suspend Note", systemImage: "pause.circle.fill")
                 }
-                Button { act { await model.buryNote(noteId) } } label: {
+                Button { selectAndAct { await model.buryNote(noteId) } } label: {
                     Label("Bury Note", systemImage: "moon.zzz.fill")
                 }
             }
 
             Section {
-                Button(role: .destructive) { confirmDeleteNote = true } label: {
+                Button(role: .destructive) {
+                    onSelection()
+                    Task { @MainActor in
+                        await Task.yield()
+                        confirmDeleteNote = true
+                    }
+                } label: {
                     Label("Delete Note", systemImage: "trash")
                 }
             }
@@ -126,7 +145,8 @@ public struct CardActionSections: View {
 
     /// Run a model action and forward its outcome. `nil` means the action
     /// failed and the model already raised the error alert.
-    private func act(_ body: @escaping () async -> Bool?) {
+    private func selectAndAct(_ body: @escaping () async -> Bool?) {
+        onSelection()
         Task { if let shouldAdvance = await body() { onAction(shouldAdvance) } }
     }
 }

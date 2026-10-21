@@ -7,6 +7,7 @@
 
 import AppCore
 import AppShared
+import AnkiKit
 import OSLog
 import Reader
 import SwiftUI
@@ -21,12 +22,24 @@ struct CardWebView {
     @Environment(\.colorScheme) private var colorScheme
 
     let html: String
+    let cardID: CardID?
     let cardCSS: String
     let autoplayEnabled: Bool
+    let zoomScale: Double
+    let maximumContentWidth: CGFloat?
     let isAnswerSide: Bool
     let cardOrdinal: UInt32
     let replayRequestID: Int
+    let replayCardID: CardID?
+    let replayIsAnswerSide: Bool?
     let stopAudioRequestID: Int
+    let scrollRequestID: Int
+    let scrollDirection: ReviewScrollDirection
+    let continuousScrollDelta: CGFloat?
+    let userActionRequestID: Int
+    let userActionIndex: Int?
+    let userActionCardID: CardID?
+    let userActionIsAnswerSide: Bool?
     let replayMode: CardWebViewReplayMode
     let showInlineAudioReplayButtons: Bool
     let openLinksExternally: Bool
@@ -36,19 +49,34 @@ struct CardWebView {
     let prefetchHTML: String?
     let contentAlignment: CardWebViewContentAlignment
     let bottomContentInset: CGFloat
+    let tapControlsEnabled: Bool
     let onAudioStateChange: ((Bool) -> Void)?
     let onCardBackgroundColorChange: ((Color, Bool) -> Void)?
     let onLookupRequested: ((String?, String?, CGPoint) -> Void)?
     let onShowAnswerRequested: (() -> Void)?
+    let onReviewTapRequested: ((CGFloat) -> Void)?
+    let onEditableFocusChange: ((Bool) -> Void)?
 
     init(
         html: String,
+        cardID: CardID? = nil,
         cardCSS: String = "",
         autoplayEnabled: Bool = true,
+        zoomScale: Double = 1,
+        maximumContentWidth: CGFloat? = nil,
         isAnswerSide: Bool = false,
         cardOrdinal: UInt32 = 0,
         replayRequestID: Int = 0,
+        replayCardID: CardID? = nil,
+        replayIsAnswerSide: Bool? = nil,
         stopAudioRequestID: Int = 0,
+        scrollRequestID: Int = 0,
+        scrollDirection: ReviewScrollDirection = .down,
+        continuousScrollDelta: CGFloat? = nil,
+        userActionRequestID: Int = 0,
+        userActionIndex: Int? = nil,
+        userActionCardID: CardID? = nil,
+        userActionIsAnswerSide: Bool? = nil,
         replayMode: CardWebViewReplayMode = .question,
         showInlineAudioReplayButtons: Bool = true,
         openLinksExternally: Bool = true,
@@ -58,18 +86,33 @@ struct CardWebView {
         prefetchHTML: String? = nil,
         contentAlignment: CardWebViewContentAlignment = .center,
         bottomContentInset: CGFloat = 0,
+        tapControlsEnabled: Bool = false,
         onAudioStateChange: ((Bool) -> Void)? = nil,
         onCardBackgroundColorChange: ((Color, Bool) -> Void)? = nil,
         onLookupRequested: ((String?, String?, CGPoint) -> Void)? = nil,
-        onShowAnswerRequested: (() -> Void)? = nil
+        onShowAnswerRequested: (() -> Void)? = nil,
+        onReviewTapRequested: ((CGFloat) -> Void)? = nil,
+        onEditableFocusChange: ((Bool) -> Void)? = nil
     ) {
         self.html = html
+        self.cardID = cardID
         self.cardCSS = cardCSS
         self.autoplayEnabled = autoplayEnabled
+        self.zoomScale = zoomScale
+        self.maximumContentWidth = maximumContentWidth
         self.isAnswerSide = isAnswerSide
         self.cardOrdinal = cardOrdinal
         self.replayRequestID = replayRequestID
+        self.replayCardID = replayCardID
+        self.replayIsAnswerSide = replayIsAnswerSide
         self.stopAudioRequestID = stopAudioRequestID
+        self.scrollRequestID = scrollRequestID
+        self.scrollDirection = scrollDirection
+        self.continuousScrollDelta = continuousScrollDelta
+        self.userActionRequestID = userActionRequestID
+        self.userActionIndex = userActionIndex
+        self.userActionCardID = userActionCardID
+        self.userActionIsAnswerSide = userActionIsAnswerSide
         self.replayMode = replayMode
         self.showInlineAudioReplayButtons = showInlineAudioReplayButtons
         self.openLinksExternally = openLinksExternally
@@ -79,10 +122,13 @@ struct CardWebView {
         self.prefetchHTML = prefetchHTML
         self.contentAlignment = contentAlignment
         self.bottomContentInset = bottomContentInset
+        self.tapControlsEnabled = tapControlsEnabled
         self.onAudioStateChange = onAudioStateChange
         self.onCardBackgroundColorChange = onCardBackgroundColorChange
         self.onLookupRequested = onLookupRequested
         self.onShowAnswerRequested = onShowAnswerRequested
+        self.onReviewTapRequested = onReviewTapRequested
+        self.onEditableFocusChange = onEditableFocusChange
     }
 
     func makeCoordinator() -> CardWebViewCoordinator {
@@ -90,7 +136,9 @@ struct CardWebView {
             onAudioStateChange: onAudioStateChange,
             onCardBackgroundColorChange: onCardBackgroundColorChange,
             onLookupRequested: onLookupRequested,
-            onShowAnswerRequested: onShowAnswerRequested
+            onShowAnswerRequested: onShowAnswerRequested,
+            onReviewTapRequested: onReviewTapRequested,
+            onEditableFocusChange: onEditableFocusChange
         )
     }
 
@@ -98,6 +146,7 @@ struct CardWebView {
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         config.setURLSchemeHandler(CardAssetScheme(), forURLScheme: CardAssetPath.scheme)
+        config.userContentController.addScriptMessageHandler(coordinator, contentWorld: .page, name: "amgiPrepareAudio")
         config.userContentController.add(coordinator, name: "amgiAudioState")
         config.userContentController.add(coordinator, name: "amgiOpenLink")
         config.userContentController.add(coordinator, name: "amgiSpeakTts")
@@ -105,6 +154,10 @@ struct CardWebView {
         config.userContentController.add(coordinator, name: "amgiCardTheme")
         config.userContentController.add(coordinator, name: "amgiLookupText")
         config.userContentController.add(coordinator, name: "amgiShowAnswer")
+        config.userContentController.add(coordinator, name: "amgiReviewTap")
+        config.userContentController.add(coordinator, name: "amgiEditableFocus")
+        config.userContentController.add(coordinator, name: "amgiCardReady")
+        config.userContentController.add(coordinator, name: "amgiUserActionComplete")
 
         config.userContentController.addUserScript(WKUserScript(
             source: LookupExtractionScript.source,
@@ -126,6 +179,7 @@ struct CardWebView {
     }
 
     static func dismantleWebView(_ webView: WKWebView, coordinator: CardWebViewCoordinator) {
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiPrepareAudio", contentWorld: .page)
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiAudioState")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiOpenLink")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiSpeakTts")
@@ -133,7 +187,12 @@ struct CardWebView {
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiCardTheme")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiLookupText")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiShowAnswer")
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiReviewTap")
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiEditableFocus")
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiCardReady")
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "amgiUserActionComplete")
         coordinator.stopTTS()
+        coordinator.currentWebView = nil
     }
 
     func updateWebView(_ webView: WKWebView, coordinator: CardWebViewCoordinator) {
@@ -151,20 +210,39 @@ struct CardWebView {
         let pageSignature = "\(isDarkMode)"
         // `bottomContentInset` joins the signature because it is now carried as
         // body padding in the show-card script rather than as a scroll inset.
-        let contentSignature = "\(autoplayEnabled)|\(isAnswerSide)|\(lookupPopupEnabled)|\(dictionaryScanLength)|\(replayMode.rawValue)|\(cardOrdinal)|\(alignTop)|\(showInlineAudioReplayButtons)|\(Int(bottomContentInset))|\(cardCSS.hashValue)|\(html.hashValue)|\(prefetchHTML?.hashValue ?? 0)"
+        let contentSignature = "\(cardID?.rawValue ?? 0)|\(autoplayEnabled)|\(isAnswerSide)|\(lookupPopupEnabled)|\(dictionaryScanLength)|\(tapControlsEnabled)|\(replayMode.rawValue)|\(cardOrdinal)|\(alignTop)|\(showInlineAudioReplayButtons)|\(Int(bottomContentInset))|\(cardCSS.hashValue)|\(html.hashValue)|\(prefetchHTML?.hashValue ?? 0)"
 
         // Bookkeeping that has to track every render, expensive or not.
         coordinator.openLinksExternally = openLinksExternally
         coordinator.currentWebView = webView
         webView.overrideUserInterfaceStyle = isDarkMode ? .dark : .light
+        webView.pageZoom = CGFloat(ReviewZoomPolicy.clamped(zoomScale))
+        let width = maximumContentWidth.map { "\($0)px" } ?? "none"
+        let layoutScript = """
+            document.documentElement.style.setProperty('--amgi-content-max-width', '\(width)');
+            document.documentElement.classList.toggle('amgi-regular-width', \(maximumContentWidth != nil));
+            """
+        if coordinator.contentLayoutScript != layoutScript {
+            coordinator.contentLayoutScript = layoutScript
+            if coordinator.isPageLoaded {
+                webView.evaluateJavaScript(layoutScript) { _, error in
+                    if let error { Log.review.error("card layout script failed: \(error)") }
+                }
+            }
+        }
 
         let pageChanged = coordinator.lastPageSignature != pageSignature
         let contentChanged = coordinator.lastContentSignature != contentSignature
+        let renderIdentity = "\(pageSignature)|\(contentSignature)"
+
+        if pageChanged || contentChanged {
+            coordinator.beginContentUpdate(identity: renderIdentity)
+        }
 
         if pageChanged || contentChanged {
             // Convert Anki [sound:filename.mp3] tags to <audio> HTML elements.
             // The Rust renderer keeps these tags literal; the client must expand them.
-            let processedHTML = Self.deferCardScripts(in:
+            let processedHTML = Self.userActionResetHTML + Self.deferCardScripts(in:
                 Self.expandTTSTags(
                     in: Self.expandSoundTags(
                         html,
@@ -188,12 +266,14 @@ struct CardWebView {
                 isAnswerSide: isAnswerSide,
                 lookupPopupEnabled: lookupPopupEnabled,
                 dictionaryScanLength: dictionaryScanLength,
+                tapControlsEnabled: tapControlsEnabled,
                 bodyClass: bodyClass,
                 autoplayEnabled: autoplayEnabled,
                 replayMode: replayMode.rawValue,
                 alignTop: alignTop,
                 bodyPaddingBottom: bodyPaddingBottom,
-                cardPaddingBottom: cardPaddingBottom
+                cardPaddingBottom: cardPaddingBottom,
+                contentGeneration: coordinator.contentGeneration
             )
             // Only when the card content actually changes. Unconditionally,
             // any unrelated re-render — including the audio callback writing
@@ -236,19 +316,73 @@ struct CardWebView {
                 }
             }
         }
+        if contentChanged {
+            coordinator.lastStopAudioRequestID = stopAudioRequestID
+        }
         if replayRequestID != coordinator.lastReplayRequestID {
             coordinator.lastReplayRequestID = replayRequestID
-            webView.evaluateJavaScript("window.amgiReplayAll && window.amgiReplayAll('" + replayMode.rawValue + "');") { _, error in
-                if let error { Log.review.error("replayAll script failed: \(error)") }
+            if replayCardID == cardID && replayIsAnswerSide == isAnswerSide {
+                coordinator.observeAudioCommand(
+                    requestID: replayRequestID,
+                    command: .replay(replayMode),
+                    contentIdentity: renderIdentity,
+                    webView: webView
+                )
             }
         }
 
-        if stopAudioRequestID != coordinator.lastStopAudioRequestID {
+        if !contentChanged && stopAudioRequestID != coordinator.lastStopAudioRequestID {
             coordinator.lastStopAudioRequestID = stopAudioRequestID
-            webView.evaluateJavaScript("window.amgiStopAllAudio && window.amgiStopAllAudio();") { _, error in
-                if let error { Log.review.error("stopAllAudio script failed: \(error)") }
-            }
+            coordinator.observeAudioCommand(
+                requestID: stopAudioRequestID,
+                command: .stop,
+                contentIdentity: renderIdentity,
+                webView: webView
+            )
         }
+
+        if scrollRequestID != coordinator.lastScrollRequestID {
+            coordinator.lastScrollRequestID = scrollRequestID
+            let scrollView = webView.scrollView
+            let minimumOffset = -scrollView.adjustedContentInset.top
+            let maximumOffset = max(
+                minimumOffset,
+                scrollView.contentSize.height - scrollView.bounds.height
+                    + scrollView.adjustedContentInset.bottom
+            )
+            let target: CGFloat
+            let animated: Bool
+            if let continuousScrollDelta {
+                target = ReviewScrollPolicy.targetOffset(
+                    currentOffset: scrollView.contentOffset.y,
+                    minimumOffset: minimumOffset,
+                    maximumOffset: maximumOffset,
+                    delta: continuousScrollDelta
+                )
+                animated = false
+            } else {
+                target = ReviewScrollPolicy.targetOffset(
+                    currentOffset: scrollView.contentOffset.y,
+                    minimumOffset: minimumOffset,
+                    maximumOffset: maximumOffset,
+                    direction: scrollDirection
+                )
+                animated = true
+            }
+            scrollView.setContentOffset(
+                CGPoint(x: scrollView.contentOffset.x, y: target),
+                animated: animated
+            )
+        }
+
+        coordinator.observeUserAction(
+            requestID: userActionRequestID,
+            index: userActionIndex,
+            targetsCurrentContent: userActionCardID == cardID
+                && userActionIsAnswerSide == isAnswerSide,
+            contentIdentity: renderIdentity,
+            webView: webView
+        )
 
         if lookupHighlight.generation != coordinator.lastLookupHighlightGeneration {
             coordinator.lastLookupHighlightGeneration = lookupHighlight.generation
@@ -261,6 +395,55 @@ struct CardWebView {
     }
 
     // MARK: - Helpers
+
+    private static let userActionResetHTML = """
+        <script type="application/x-amgi-card-script" data-amgi-card-script="1">
+        window.userJs1 = undefined;
+        window.userJs2 = undefined;
+        window.userJs3 = undefined;
+        window.userJs4 = undefined;
+        window.userJs5 = undefined;
+        window.userJs6 = undefined;
+        window.userJs7 = undefined;
+        window.userJs8 = undefined;
+        </script>
+        """
+
+    static func userActionScript(
+        index: Int,
+        contentGeneration: Int = 0,
+        requestID: Int = 0
+    ) -> String? {
+        let functionName: String
+        switch index {
+        case 1: functionName = "userJs1"
+        case 2: functionName = "userJs2"
+        case 3: functionName = "userJs3"
+        case 4: functionName = "userJs4"
+        case 5: functionName = "userJs5"
+        case 6: functionName = "userJs6"
+        case 7: functionName = "userJs7"
+        case 8: functionName = "userJs8"
+        default: return nil
+        }
+        return """
+            void amgiQueueAction(function() {
+                try {
+                    if (window.__amgiContentGeneration === \(contentGeneration)
+                        && typeof window.\(functionName) === 'function') {
+                        window.\(functionName)();
+                    }
+                } catch (error) {
+                    console.error('userJs\(index) failed', error);
+                } finally {
+                    window.webkit.messageHandlers.amgiUserActionComplete.postMessage({
+                        contentGeneration: \(contentGeneration),
+                        requestID: \(requestID)
+                    });
+                }
+            });
+            """
+    }
 
     /// Loads the frame HTML template from the bundled CardWebViewBridge.js resource.
     /// Despite the .js extension, this file is the complete HTML frame document

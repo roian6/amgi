@@ -27,19 +27,42 @@ import AmgiCardWeb
 ///  - AVSpeechSynthesizer integration for TTS
 ///  - Frame-load lifecycle so per-card evaluateJavaScript runs at the right moment
 @MainActor
-final class CardWebViewCoordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler, AVSpeechSynthesizerDelegate {
+final class CardWebViewCoordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply, AVSpeechSynthesizerDelegate {
+
+    private struct PendingUserAction {
+        let requestID: Int
+        let index: Int
+        let contentIdentity: String
+        let contentGeneration: Int
+        var isExecuting = false
+    }
+
+    private struct ActiveTTS {
+        let contentGeneration: Int
+        let requestID: Int
+        let utterance: AVSpeechUtterance
+    }
 
     // MARK: State tracked across updates
 
     var lastPageSignature: String?
     var lastContentSignature: String?
     var lastReplayRequestID: Int = 0
+    var contentLayoutScript = ""
     var lastStopAudioRequestID: Int = 0
+    var lastScrollRequestID: Int = 0
+    private(set) var lastUserActionRequestID: Int = 0
+    private(set) var contentGeneration: Int = 0
     var lastLookupHighlightGeneration: Int = 0
     var isPageLoaded = false
     var pendingUpdateScript: String?
     var openLinksExternally: Bool = true
     weak var currentWebView: WKWebView?
+    private var currentContentIdentity: String?
+    private var readyContentGeneration: Int?
+    private var lastObservedUserActionRequestID = 0
+    private var pendingUserActions: [PendingUserAction] = []
+    private var audioCommandQueue = CardWebViewAudioCommandQueue()
 
     // MARK: Callbacks (injected by makeCoordinator)
 
@@ -47,11 +70,14 @@ final class CardWebViewCoordinator: NSObject, WKNavigationDelegate, WKScriptMess
     private let onCardBackgroundColorChange: ((Color, Bool) -> Void)?
     private let onLookupRequested: ((String?, String?, CGPoint) -> Void)?
     private let onShowAnswerRequested: (() -> Void)?
+    private let onReviewTapRequested: ((CGFloat) -> Void)?
+    private let onEditableFocusChange: ((Bool) -> Void)?
 
     // MARK: Private state
 
     private var lastThemePayload: String?
     private let speechSynthesizer = AVSpeechSynthesizer()
+    private var activeTTS: ActiveTTS?
 
     // MARK: Init
 
@@ -59,12 +85,16 @@ final class CardWebViewCoordinator: NSObject, WKNavigationDelegate, WKScriptMess
         onAudioStateChange: ((Bool) -> Void)? = nil,
         onCardBackgroundColorChange: ((Color, Bool) -> Void)? = nil,
         onLookupRequested: ((String?, String?, CGPoint) -> Void)? = nil,
-        onShowAnswerRequested: (() -> Void)? = nil
+        onShowAnswerRequested: (() -> Void)? = nil,
+        onReviewTapRequested: ((CGFloat) -> Void)? = nil,
+        onEditableFocusChange: ((Bool) -> Void)? = nil
     ) {
         self.onAudioStateChange = onAudioStateChange
         self.onCardBackgroundColorChange = onCardBackgroundColorChange
         self.onLookupRequested = onLookupRequested
         self.onShowAnswerRequested = onShowAnswerRequested
+        self.onReviewTapRequested = onReviewTapRequested
+        self.onEditableFocusChange = onEditableFocusChange
         super.init()
         speechSynthesizer.delegate = self
     }
@@ -72,8 +102,47 @@ final class CardWebViewCoordinator: NSObject, WKNavigationDelegate, WKScriptMess
     // MARK: - WKScriptMessageHandler
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "amgiCardReady" {
+            guard let generation = (message.body as? NSNumber)?.intValue,
+                  let webView = message.webView else { return }
+            markContentReady(generation: generation, webView: webView)
+            return
+        }
+
+        if message.name == "amgiUserActionComplete" {
+            guard let body = message.body as? [String: Any],
+                  let generation = (body["contentGeneration"] as? NSNumber)?.intValue,
+                  let requestID = (body["requestID"] as? NSNumber)?.intValue,
+                  let webView = message.webView else { return }
+            completeUserAction(
+                requestID: requestID,
+                contentGeneration: generation,
+                webView: webView
+            )
+            return
+        }
+
+        if message.name == "amgiEditableFocus" {
+            if let isFocused = message.body as? Bool {
+                onEditableFocusChange?(isFocused)
+            } else if let number = message.body as? NSNumber {
+                onEditableFocusChange?(number.boolValue)
+            }
+            return
+        }
+
         if message.name == "amgiShowAnswer" {
             onShowAnswerRequested?()
+            return
+        }
+
+        if message.name == "amgiReviewTap" {
+            guard let body = message.body as? [String: Any],
+                  let x = body["x"] as? NSNumber,
+                  let width = body["width"] as? NSNumber,
+                  width.doubleValue > 0 else { return }
+            let fraction = min(max(x.doubleValue / width.doubleValue, 0), 1)
+            onReviewTapRequested?(CGFloat(fraction))
             return
         }
 
@@ -87,7 +156,7 @@ final class CardWebViewCoordinator: NSObject, WKNavigationDelegate, WKScriptMess
         }
 
         if message.name == "amgiStopTts" {
-            stopTTS()
+            stopTTS(from: message.body)
             return
         }
 
@@ -132,31 +201,60 @@ final class CardWebViewCoordinator: NSObject, WKNavigationDelegate, WKScriptMess
         openLink(href)
     }
 
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage,
+        replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void
+    ) {
+        guard message.name == "amgiPrepareAudio",
+              message.frameInfo.isMainFrame,
+              let body = message.body as? [String: Any],
+              let generation = (body["contentGeneration"] as? NSNumber)?.intValue,
+              generation == contentGeneration,
+              message.webView != nil,
+              message.webView === currentWebView else {
+            replyHandler(false, nil)
+            return
+        }
+        replyHandler(ReviewAudioSession.prepareForPlayback(), nil)
+    }
+
     // MARK: - AVSpeechSynthesizerDelegate
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        let utteranceID = ObjectIdentifier(utterance)
         Task { @MainActor [weak self] in
-            self?.onAudioStateChange?(true)
+            guard let self,
+                  let activeTTS = self.activeTTS,
+                  ObjectIdentifier(activeTTS.utterance) == utteranceID,
+                  activeTTS.contentGeneration == self.contentGeneration else { return }
+            self.onAudioStateChange?(true)
         }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        let utteranceID = ObjectIdentifier(utterance)
         Task { @MainActor [weak self] in
-            self?.onAudioStateChange?(false)
+            self?.finishTTS(utteranceID)
         }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        let utteranceID = ObjectIdentifier(utterance)
         Task { @MainActor [weak self] in
-            self?.onAudioStateChange?(false)
+            self?.finishTTS(utteranceID)
         }
     }
 
     // MARK: - TTS
 
     func stopTTS() {
-        guard speechSynthesizer.isSpeaking else { return }
-        speechSynthesizer.stopSpeaking(at: .immediate)
+        let hadActiveTTS = activeTTS != nil
+        activeTTS = nil
+        if speechSynthesizer.isSpeaking {
+            speechSynthesizer.stopSpeaking(at: .immediate)
+        }
+        guard hadActiveTTS else { return }
         onAudioStateChange?(false)
     }
 
@@ -204,7 +302,7 @@ final class CardWebViewCoordinator: NSObject, WKNavigationDelegate, WKScriptMess
 
         guard let pendingUpdateScript else { return }
         self.pendingUpdateScript = nil
-        webView.evaluateJavaScript(pendingUpdateScript) { _, error in
+        webView.evaluateJavaScript(contentLayoutScript + "\n" + pendingUpdateScript) { _, error in
             if let error {
                 Log.review.error("evaluateJavaScript error: \(error)")
             }
@@ -219,11 +317,127 @@ final class CardWebViewCoordinator: NSObject, WKNavigationDelegate, WKScriptMess
         Log.review.error("Provisional navigation failed: \(error)")
     }
 
+    func beginContentUpdate(identity: String) {
+        contentGeneration &+= 1
+        currentContentIdentity = identity
+        readyContentGeneration = nil
+        audioCommandQueue.beginContentUpdate(
+            generation: contentGeneration,
+            identity: identity
+        )
+        if let lastPending = pendingUserActions.last {
+            lastUserActionRequestID = lastPending.requestID
+        }
+        pendingUserActions.removeAll()
+    }
+
+    func observeUserAction(
+        requestID: Int,
+        index: Int?,
+        targetsCurrentContent: Bool,
+        contentIdentity: String,
+        webView: WKWebView
+    ) {
+        guard requestID != lastObservedUserActionRequestID else { return }
+        lastObservedUserActionRequestID = requestID
+        guard targetsCurrentContent,
+              let index,
+              (1...8).contains(index),
+              contentIdentity == currentContentIdentity else {
+            lastUserActionRequestID = requestID
+            return
+        }
+        pendingUserActions.append(PendingUserAction(
+            requestID: requestID,
+            index: index,
+            contentIdentity: contentIdentity,
+            contentGeneration: contentGeneration
+        ))
+        executeNextUserActionIfReady(in: webView)
+    }
+
+    private func markContentReady(generation: Int, webView: WKWebView) {
+        guard generation == contentGeneration else { return }
+        readyContentGeneration = generation
+        audioCommandQueue.markContentReady(generation: generation)
+        executeAudioCommandIfReady(in: webView)
+        executeNextUserActionIfReady(in: webView)
+    }
+
+    func observeAudioCommand(
+        requestID: Int,
+        command: CardWebViewAudioCommand,
+        contentIdentity: String,
+        webView: WKWebView
+    ) {
+        audioCommandQueue.enqueue(
+            requestID: requestID,
+            command: command,
+            contentGeneration: contentGeneration,
+            contentIdentity: contentIdentity
+        )
+        executeAudioCommandIfReady(in: webView)
+    }
+
+    private func executeAudioCommandIfReady(in webView: WKWebView) {
+        guard let command = audioCommandQueue.takeReadyCommand() else { return }
+        let script: String
+        switch command {
+        case .replay(let mode):
+            script = "window.amgiReplayAll && window.amgiReplayAll('\(mode.rawValue)', \(contentGeneration));"
+        case .stop:
+            script = "window.amgiStopAllAudio && window.amgiStopAllAudio(\(contentGeneration));"
+        }
+        webView.evaluateJavaScript(script) { _, error in
+            if let error { Log.review.error("audio command failed: \(error)") }
+        }
+    }
+
+    private func executeNextUserActionIfReady(in webView: WKWebView) {
+        guard readyContentGeneration == contentGeneration,
+              !pendingUserActions.isEmpty,
+              !pendingUserActions[0].isExecuting else { return }
+        let pending = pendingUserActions[0]
+        guard pending.contentGeneration == contentGeneration,
+              pending.contentIdentity == currentContentIdentity,
+              let script = CardWebView.userActionScript(
+                index: pending.index,
+                contentGeneration: pending.contentGeneration,
+                requestID: pending.requestID
+              ) else { return }
+        pendingUserActions[0].isExecuting = true
+        webView.evaluateJavaScript(script) { [weak self] _, error in
+            guard let error else { return }
+            Log.review.error("userJs\(pending.index) failed: \(error)")
+            self?.completeUserAction(
+                requestID: pending.requestID,
+                contentGeneration: pending.contentGeneration,
+                webView: webView
+            )
+        }
+    }
+
+    private func completeUserAction(
+        requestID: Int,
+        contentGeneration: Int,
+        webView: WKWebView
+    ) {
+        guard let pending = pendingUserActions.first,
+              pending.requestID == requestID,
+              pending.contentGeneration == contentGeneration else { return }
+        lastUserActionRequestID = requestID
+        pendingUserActions.removeFirst()
+        executeNextUserActionIfReady(in: webView)
+    }
+
 }
 
 private extension CardWebViewCoordinator {
     func speakTTS(from body: Any) {
-        guard let payload = body as? [String: Any] else { return }
+        guard let payload = body as? [String: Any],
+              let generation = (payload["contentGeneration"] as? NSNumber)?.intValue,
+              let requestID = (payload["requestID"] as? NSNumber)?.intValue,
+              generation == contentGeneration else { return }
         let text = (payload["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !text.isEmpty else { return }
 
@@ -245,7 +459,39 @@ private extension CardWebViewCoordinator {
         let speedMultiplier = Float((payload["speed"] as? String) ?? "") ?? 1
         let mappedRate = AVSpeechUtteranceDefaultSpeechRate * max(0.25, min(speedMultiplier, 2.0))
         utterance.rate = min(max(mappedRate, AVSpeechUtteranceMinimumSpeechRate), AVSpeechUtteranceMaximumSpeechRate)
+        activeTTS = ActiveTTS(
+            contentGeneration: generation,
+            requestID: requestID,
+            utterance: utterance
+        )
+        guard ReviewAudioSession.prepareForPlayback() else {
+            finishTTS(ObjectIdentifier(utterance))
+            return
+        }
         speechSynthesizer.speak(utterance)
+    }
+
+    func stopTTS(from body: Any) {
+        guard let payload = body as? [String: Any],
+              let generation = (payload["contentGeneration"] as? NSNumber)?.intValue,
+              let requestID = (payload["requestID"] as? NSNumber)?.intValue,
+              let activeTTS,
+              activeTTS.contentGeneration == generation,
+              activeTTS.requestID == requestID else { return }
+        stopTTS()
+    }
+
+    func finishTTS(_ utteranceID: ObjectIdentifier) {
+        guard let activeTTS,
+              ObjectIdentifier(activeTTS.utterance) == utteranceID else { return }
+        self.activeTTS = nil
+        guard activeTTS.contentGeneration == contentGeneration else { return }
+        onAudioStateChange?(false)
+        currentWebView?.evaluateJavaScript(
+            "window.amgiTtsDidFinish && window.amgiTtsDidFinish(\(activeTTS.contentGeneration), \(activeTTS.requestID));"
+        ) { _, error in
+            if let error { Log.review.error("TTS completion failed: \(error)") }
+        }
     }
 
     func preferredVoice(lang: String, preferredNames: [String]) -> AVSpeechSynthesisVoice? {
